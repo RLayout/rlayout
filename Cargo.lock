@@ -1943,8 +1943,13 @@ name = "rlayout-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "js-sys",
  "rlayout-gds",
  "rlayout-viewer",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]

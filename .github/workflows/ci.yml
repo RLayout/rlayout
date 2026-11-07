@@ -143,6 +143,43 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  web:
+    name: Build browser app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and check WebAssembly
+        env:
+          RLAYOUT_RUST_TOOLCHAIN: ${{ env.RUST_TOOLCHAIN }}
+        run: bash scripts/build-web.sh
+
+  publish-web:
+    name: Request website publish
+    needs: [build, web]
+    if: github.repository == 'RLayout/rlayout' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Publish tested source commit
+        env:
+          GH_TOKEN: ${{ secrets.PAGES_DISPATCH_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo 'Set PAGES_DISPATCH_TOKEN with access to RLayout/rlayout.github.io' >&2
+            exit 1
+          fi
+          current_sha=$(gh api repos/RLayout/rlayout/commits/main --jq .sha)
+          if [[ "$current_sha" != "$SOURCE_SHA" ]]; then
+            echo 'Skipping a source commit superseded during CI'
+            exit 0
+          fi
+          gh api --method POST repos/RLayout/rlayout.github.io/dispatches \
+            -f event_type=publish -f "client_payload[source_sha]=$SOURCE_SHA"
+
   release:
     name: Publish tagged release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>RLayout</title>
+    <link data-trunk rel="icon" href="assets/icon.png">
+    <link data-trunk rel="rust" href="crates/app/Cargo.toml" data-target-name="rlayout_app">
+    <style>
+        html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #1b1b1b; color: #eee; font: 16px system-ui, sans-serif; }
+        #canvas { display: block; width: 100%; height: 100%; outline: none; }
+        #startup { position: fixed; inset: 0; display: grid; place-content: center; text-align: center; padding: 24px; }
+        #startup[hidden] { display: none; }
+        #startup p { max-width: 560px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <canvas id="canvas"></canvas>
+    <input id="gds-file" type="file" accept=".gds,.gds2" hidden>
+    <div id="startup" role="status" aria-live="polite">
+        <h1>RLayout</h1>
+        <p id="startup-message">Starting the layout viewer…</p>
+    </div>
+    <noscript>RLayout needs JavaScript and WebAssembly to run.</noscript>
+    <script>
+        const startup = document.getElementById("startup");
+        const message = document.getElementById("startup-message");
+        function showFailure(error) {
+            startup.hidden = false;
+            startup.setAttribute("role", "alert");
+            message.textContent = `RLayout could not start.\n${error}\nTry a browser with WebGPU or WebGL enabled.`;
+            console.error(error);
+        }
+        window.addEventListener("unhandledrejection", event => showFailure(event.reason));
+        window.addEventListener("error", event => showFailure(event.message));
+        window.addEventListener("TrunkApplicationStarted", async () => {
+            try {
+                const handle = new window.wasmBindings.WebHandle();
+                await handle.start(document.getElementById("canvas"));
+                startup.hidden = true;
+                window.rlayout = handle;
+                const monitor = setInterval(() => {
+                    if (handle.has_panicked()) {
+                        clearInterval(monitor);
+                        showFailure(handle.panic_message() || "The viewer stopped unexpectedly.");
+                    }
+                }, 1000);
+            } catch (error) {
+                showFailure(error);
+            }
+        });
+    </script>
+</body>
+</html>
