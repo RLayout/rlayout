@@ -389,10 +389,13 @@ impl eframe::App for Application {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let path = std::env::args_os().nth(1).map(PathBuf::from);
+    let icon =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/window-icon.png"))?;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([640.0, 400.0]),
+            .with_min_inner_size([640.0, 400.0])
+            .with_icon(icon),
         renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };

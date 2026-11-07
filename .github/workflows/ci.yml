@@ -1,0 +1,179 @@
+name: CI and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: '1.98.1'
+
+jobs:
+  build:
+    name: Build and test (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - platform: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open('Cargo.toml', 'rb') as manifest:
+              version = tomllib.load(manifest)['workspace']['package']['version']
+          tag = os.environ['RELEASE_TAG']
+          if tag and tag != f'v{version}':
+              raise SystemExit(f'Tag {tag!r} must match workspace version v{version}')
+          bundle_version = version.split('-')[0].split('+')[0]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'version={version}\nbundle_version={bundle_version}\n')
+          PY
+
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
+            libxcursor-dev libxrandr-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy,rustfmt
+          rustup target add --toolchain "$RUST_TOOLCHAIN" "${{ matrix.target }}"
+
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo +"$RUST_TOOLCHAIN" fmt --all -- --check
+
+      - name: Check Clippy
+        run: cargo +"$RUST_TOOLCHAIN" clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo +"$RUST_TOOLCHAIN" test --workspace --locked
+
+      - name: Build release binary
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '15.0'
+        run: cargo +"$RUST_TOOLCHAIN" build --release --locked --package rlayout-app --bin rlayout --target "${{ matrix.target }}"
+
+      - name: Package release
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          BUNDLE_VERSION: ${{ steps.version.outputs.bundle_version }}
+          PLATFORM: ${{ matrix.platform }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          distribution="rlayout-${PACKAGE_VERSION}-${PLATFORM}"
+          mkdir -p "dist/$distribution"
+          cp LICENSE "dist/$distribution/"
+          if [[ "$RUNNER_OS" == 'macOS' ]]; then
+            application="dist/$distribution/RLayout.app"
+            mkdir -p "$application/Contents/MacOS" "$application/Contents/Resources"
+            cp "target/$TARGET/release/rlayout" "$application/Contents/MacOS/rlayout"
+            iconset="$RUNNER_TEMP/rlayout.iconset"
+            mkdir -p "$iconset"
+            for size in 16 32 128 256 512; do
+              sips -z "$size" "$size" assets/icon.png --out "$iconset/icon_${size}x${size}.png" > /dev/null
+              doubled=$((size * 2))
+              sips -z "$doubled" "$doubled" assets/icon.png --out "$iconset/icon_${size}x${size}@2x.png" > /dev/null
+            done
+            iconutil -c icns "$iconset" -o "$application/Contents/Resources/icon.icns"
+            export APPLICATION="$application"
+            python3 - <<'PY'
+          import os
+          import pathlib
+          import plistlib
+
+          contents = pathlib.Path(os.environ['APPLICATION']) / 'Contents'
+          metadata = {
+              'CFBundleName': 'RLayout',
+              'CFBundleDisplayName': 'RLayout',
+              'CFBundleIdentifier': 'io.github.nealpro.rlayout',
+              'CFBundleExecutable': 'rlayout',
+              'CFBundlePackageType': 'APPL',
+              'CFBundleIconFile': 'icon.icns',
+              'CFBundleShortVersionString': os.environ['BUNDLE_VERSION'],
+              'CFBundleVersion': os.environ['BUNDLE_VERSION'],
+              'LSMinimumSystemVersion': '15.0',
+              'NSHighResolutionCapable': True,
+          }
+          with (contents / 'Info.plist').open('wb') as output:
+              plistlib.dump(metadata, output)
+          PY
+            codesign --force --sign - "$application"
+            codesign --verify --strict "$application"
+          else
+            cp "target/$TARGET/release/rlayout" "dist/$distribution/rlayout"
+          fi
+          tar -czf "dist/$distribution.tar.gz" -C dist "$distribution"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rlayout-${{ matrix.platform }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish tagged release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: rlayout-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          arguments=(--verify-tag --title "RLayout $RELEASE_TAG" --generate-notes)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            arguments+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS "${arguments[@]}"
