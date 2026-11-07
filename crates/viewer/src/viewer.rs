@@ -1,14 +1,16 @@
 pub use egui;
 
+mod raster;
+
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use egui::{Color32, Pos2, Rect, Vec2, epaint::Mesh};
 use rlayout_core::{
     Bounds, CellId, DoublePoint, Geometry, Label, LayerKey, Layout, Path, Transformation,
-    path_contour, validate_contour,
+    path_contour, shape_bounds,
 };
 use tess2_rust::{ElementType, TessStatus, Tessellator, WindingRule};
 
@@ -113,15 +115,77 @@ struct PreparedShape {
 #[derive(Debug)]
 pub struct Scene {
     layout: Layout,
-    shapes: HashMap<CellId, Vec<PreparedShape>>,
+    shapes: HashMap<CellId, OnceLock<Vec<PreparedShape>>>,
+    indexes: HashMap<CellId, raster::SpatialIndex>,
+    label_metrics: Vec<(f64, f64)>,
     label_margin: f64,
 }
 
 impl Scene {
     pub fn prepare(layout: Layout) -> Result<Self, ViewError> {
         let mut shapes = HashMap::new();
+        let mut indexes = HashMap::new();
+        let mut label_metrics = vec![(0.0_f64, 0.0_f64); layout.cells().count()];
         let mut label_margin = 0.0_f64;
         for (id, cell) in layout.cells() {
+            shapes.insert(id, OnceLock::new());
+            for shape in cell.shapes() {
+                if let Geometry::Label(label) = &shape.geometry {
+                    label_metrics[id.index()].0 = label_metrics[id.index()]
+                        .0
+                        .max(label.text.chars().count() as f64);
+                    label_metrics[id.index()].1 = label_metrics[id.index()]
+                        .1
+                        .max(label.transformation.magnification);
+                    label_margin =
+                        label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (id, cell) in layout.cells() {
+                for instance in cell.instances() {
+                    let child = label_metrics[instance.cell.index()];
+                    let previous = label_metrics[id.index()];
+                    let updated = (
+                        previous.0.max(child.0),
+                        previous
+                            .1
+                            .max(child.1 * instance.transformation.magnification),
+                    );
+                    if updated != previous {
+                        label_metrics[id.index()] = updated;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (id, _) in layout.cells() {
+            indexes.insert(id, raster::SpatialIndex::new(&layout, id, &label_metrics)?);
+        }
+        Ok(Self {
+            layout,
+            shapes,
+            indexes,
+            label_metrics,
+            label_margin,
+        })
+    }
+
+    fn prepared(&self, id: CellId) -> Result<&[PreparedShape], ViewError> {
+        let destination = self
+            .shapes
+            .get(&id)
+            .ok_or_else(|| ViewError("Missing prepared cell".into()))?;
+        if destination.get().is_none() {
+            let cell = self
+                .layout
+                .cell(id)
+                .ok_or_else(|| ViewError("Missing cell".into()))?;
             let mut prepared = Vec::with_capacity(cell.shapes().len());
             for (index, shape) in cell.shapes().iter().enumerate() {
                 let geometry = match &shape.geometry {
@@ -139,18 +203,13 @@ impl Scene {
                     Geometry::Path(path) if path.width == 0 => Ok(PreparedGeometry::Line(
                         path.points.iter().map(|point| point.to_double()).collect(),
                     )),
-                    Geometry::Path(path) => triangulate_path(path, 1.0).map(|polygon| {
-                        if path.absolute_width {
-                            PreparedGeometry::AbsolutePath(path.clone())
-                        } else {
-                            PreparedGeometry::Polygon(polygon)
-                        }
-                    }),
-                    Geometry::Label(label) => {
-                        label_margin =
-                            label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
-                        Ok(PreparedGeometry::Label(label.clone()))
+                    Geometry::Path(path) if path.absolute_width => {
+                        Ok(PreparedGeometry::AbsolutePath(path.clone()))
                     }
+                    Geometry::Path(path) => {
+                        triangulate_path(path, 1.0).map(PreparedGeometry::Polygon)
+                    }
+                    Geometry::Label(label) => Ok(PreparedGeometry::Label(label.clone())),
                 }
                 .map_err(|error| shape_error(cell.name(), shape.layer, index, error))?;
                 prepared.push(PreparedShape {
@@ -158,13 +217,14 @@ impl Scene {
                     geometry,
                 });
             }
-            shapes.insert(id, prepared);
+            if destination.set(prepared).is_err() && destination.get().is_none() {
+                return Err(ViewError("Preparing cell failed".into()));
+            }
         }
-        Ok(Self {
-            layout,
-            shapes,
-            label_margin,
-        })
+        destination
+            .get()
+            .map(|shapes| shapes.as_slice())
+            .ok_or_else(|| ViewError("Missing prepared shapes".into()))
     }
     pub fn layout(&self) -> &Layout {
         &self.layout
@@ -239,7 +299,14 @@ fn triangulate(points: Vec<DoublePoint>) -> Result<Polygon, ViewError> {
 
 fn triangulate_path(path: &Path, magnification: f64) -> Result<Polygon, ViewError> {
     let points = path_contour(path, magnification).map_err(|error| ViewError(error.to_string()))?;
-    validate_contour(&points).map_err(|error| ViewError(error.to_string()))?;
+    if points.len() < 3 {
+        return Ok(Polygon {
+            points: Vec::new(),
+            triangles: Vec::new(),
+            bounds: Bounds::from_points(path.points.iter().map(|point| point.to_double()))
+                .ok_or_else(|| ViewError("Empty path".into()))?,
+        });
+    }
     triangulate(points)
 }
 
@@ -258,12 +325,26 @@ pub struct LayerStyle {
     pub color: Color32,
 }
 
+pub struct RenderedTile {
+    pub rect: Rect,
+    pub texture: egui::TextureId,
+    pub preview: bool,
+}
+
+pub struct RenderedImage {
+    pub image: egui::ColorImage,
+    pub shape_count: usize,
+    pub cache_bytes: usize,
+}
+
 #[derive(Default)]
 pub struct RenderedFrame {
     pub meshes: Vec<Arc<Mesh>>,
     pub lines: Vec<egui::Shape>,
     pub shape_count: usize,
     pub truncated: bool,
+    pub complete: bool,
+    pub tiles: Vec<RenderedTile>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -288,6 +369,9 @@ pub struct Viewer {
     absolute_paths: HashMap<(CellId, usize, u64), Polygon>,
     pub cursor: Option<DoublePoint>,
     pub error: Option<String>,
+    raster: raster::Worker,
+    raster_key: Option<FrameKey>,
+    tile_textures: Vec<(Rect, egui::TextureHandle, bool)>,
 }
 
 impl Viewer {
@@ -331,6 +415,9 @@ impl Viewer {
             absolute_paths: HashMap::new(),
             cursor: None,
             error: None,
+            raster: raster::Worker::new(),
+            raster_key: None,
+            tile_textures: Vec::new(),
         }
     }
     pub fn layout(&self) -> &Layout {
@@ -464,40 +551,65 @@ impl Viewer {
             selected: self.selected,
             depth: self.hierarchy_depth,
             styles: self.styles.clone(),
-            text_pass: if self.scene.label_margin > 0.0 {
-                ui.ctx().cumulative_pass_nr()
-            } else {
-                0
-            },
+            text_pass: 0,
         };
-        if self
-            .frame
-            .as_ref()
-            .is_none_or(|(previous, _)| *previous != key)
-        {
-            match self.render(ui.ctx(), viewport) {
-                Ok(frame) => {
-                    self.frame = Some((key, frame));
-                    self.error = None;
+        if self.raster_key.as_ref() != Some(&key) {
+            self.raster_key = Some(key.clone());
+            self.tile_textures.clear();
+            self.frame = Some((key.clone(), RenderedFrame::default()));
+            self.error = self
+                .raster
+                .start(self.scene.clone(), key.clone(), ui.ctx().clone())
+                .err()
+                .map(|error| error.to_string());
+        }
+        for message in self.raster.receive() {
+            match message {
+                Ok(tile) => {
+                    if let Some((_, frame)) = &mut self.frame {
+                        if tile.first {
+                            frame.shape_count = 0;
+                            frame.tiles.clear();
+                        }
+                        if tile.preview {
+                            self.tile_textures.clear();
+                        }
+                        frame.shape_count = frame.shape_count.saturating_add(tile.shape_count);
+                        frame.complete = tile.complete;
+                        let texture = ui.ctx().load_texture(
+                            "layout-tile",
+                            tile.image,
+                            egui::TextureOptions::NEAREST,
+                        );
+                        frame.tiles.push(RenderedTile {
+                            rect: tile.rect,
+                            texture: texture.id(),
+                            preview: tile.preview,
+                        });
+                        self.tile_textures.push((tile.rect, texture, tile.preview));
+                        if tile.complete {
+                            self.tile_textures.retain(|(_, _, preview)| !preview);
+                            frame.tiles.retain(|tile| !tile.preview);
+                        }
+                    }
                 }
-                Err(error) => {
-                    self.error = Some(error.to_string());
-                    self.frame = None;
-                }
+                Err(error) => self.error = Some(error.to_string()),
             }
         }
-        if let Some((_, frame)) = &self.frame {
-            for mesh in &frame.meshes {
-                painter.add(egui::Shape::Mesh(mesh.clone()));
-            }
-            for line in &frame.lines {
-                painter.add(line.clone());
-            }
-            if frame.truncated {
-                painter.text(viewport.left_top() + Vec2::splat(12.0), egui::Align2::LEFT_TOP,
-                    "Display limit reached: some geometry is omitted. Zoom in or reduce hierarchy depth.",
-                    egui::FontId::proportional(14.0), Color32::YELLOW);
-            }
+        for (rect, texture, _) in &self.tile_textures {
+            painter.image(
+                texture.id(),
+                *rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        if let Some((_, frame)) = &self.frame
+            && !frame.complete
+            && self.error.is_none()
+        {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(16));
         }
         if self.selected.is_none() {
             painter.text(
@@ -518,6 +630,30 @@ impl Viewer {
             );
         }
     }
+    pub fn rendering_complete(&self) -> bool {
+        self.frame.as_ref().is_some_and(|(_, frame)| frame.complete)
+    }
+
+    pub fn render_image(
+        &self,
+        context: &egui::Context,
+        viewport: Rect,
+    ) -> Result<RenderedImage, ViewError> {
+        raster::capture(
+            self.scene.clone(),
+            FrameKey {
+                camera: self.camera,
+                viewport,
+                pixels_per_point: context.pixels_per_point(),
+                selected: self.selected,
+                depth: self.hierarchy_depth,
+                styles: self.styles.clone(),
+                text_pass: 0,
+            },
+            context.clone(),
+        )
+    }
+
     pub fn visible_shape_count(&self) -> usize {
         self.frame
             .as_ref()
@@ -529,7 +665,10 @@ impl Viewer {
         context: &egui::Context,
         viewport: Rect,
     ) -> Result<RenderedFrame, ViewError> {
-        let mut result = RenderedFrame::default();
+        let mut result = RenderedFrame {
+            complete: true,
+            ..Default::default()
+        };
         let Some(selected) = self.selected else {
             return Ok(result);
         };
@@ -540,13 +679,7 @@ impl Viewer {
         let mut stack = vec![(selected, Transformation::default(), 0_u16)];
         let mut batches: BTreeMap<LayerKey, Mesh> = BTreeMap::new();
         let mut text_batches: BTreeMap<LayerKey, Mesh> = BTreeMap::new();
-        let mut visited = 0_usize;
         while let Some((id, transformation, depth)) = stack.pop() {
-            visited += 1;
-            if visited > 250_000 {
-                result.truncated = true;
-                break;
-            }
             if !scene
                 .layout
                 .transformed_bounds(id, transformation)
@@ -557,13 +690,9 @@ impl Viewer {
             if !transformation.valid() {
                 return Err(ViewError("Hierarchy transformation overflow".into()));
             }
-            if let Some(shapes) = scene.shapes.get(&id) {
+            {
+                let shapes = scene.prepared(id)?;
                 for (index, shape) in shapes.iter().enumerate() {
-                    visited += 1;
-                    if visited > 250_000 {
-                        result.truncated = true;
-                        break;
-                    }
                     let Some(style) = self.styles.get(&shape.layer).filter(|style| style.visible)
                     else {
                         continue;
@@ -675,10 +804,6 @@ impl Viewer {
                     );
                     for row in rows.0..rows.1 {
                         for column in columns.0..columns.1 {
-                            if stack.len() + visited >= 250_000 {
-                                result.truncated = true;
-                                break;
-                            }
                             let translation = base
                                 .translation
                                 .plus(column_step.times(f64::from(column)))

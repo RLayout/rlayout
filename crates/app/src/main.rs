@@ -76,6 +76,7 @@ struct Application {
     document_path: Option<PathBuf>,
     warnings: Vec<Diagnostic>,
     error: Option<String>,
+    render_error: Option<String>,
     open_dialog: bool,
     warnings_dialog: bool,
     path_text: String,
@@ -97,6 +98,7 @@ impl Application {
             document_path: None,
             warnings: Vec::new(),
             error: None,
+            render_error: None,
             open_dialog: false,
             warnings_dialog: false,
             path_text: String::new(),
@@ -219,7 +221,7 @@ impl Application {
                 .resizable(false)
                 .collapsible(false)
                 .show(context, |ui| {
-                    ui.label("File path (.gds or .gds2, uncompressed)");
+                    ui.label("File path (.gds, .gds2, or gzip-compressed GDS)");
                     let response = ui
                         .add(egui::TextEdit::singleline(&mut self.path_text).desired_width(480.0));
                     if self.focus_path {
@@ -362,7 +364,11 @@ impl eframe::App for Application {
                         {
                             ui.label(cell.name());
                         }
-                        ui.label(format!("{} visible shapes", viewer.visible_shape_count()));
+                        ui.label(format!("{} rendered shapes", viewer.visible_shape_count()));
+                        if !viewer.rendering_complete() && viewer.error.is_none() {
+                            ui.spinner();
+                            ui.label("Rendering…");
+                        }
                         if let Some(cursor) = viewer.cursor {
                             let microns = viewer.layout().meters_per_unit() * 1e6;
                             ui.label(format!(
@@ -383,6 +389,13 @@ impl eframe::App for Application {
                 ui.centered_and_justified(|ui| { ui.label("Open a GDSII layout with File > Open, ⌘O, or drag and drop.\nWheel: zoom · Middle drag: pan · F: fit"); });
             }
         });
+        let render_error = self.viewer.as_ref().and_then(|viewer| viewer.error.clone());
+        if render_error != self.render_error {
+            if let Some(error) = &render_error {
+                self.error = Some(error.clone());
+            }
+            self.render_error = render_error;
+        }
         self.show_dialogs(&context);
     }
 }

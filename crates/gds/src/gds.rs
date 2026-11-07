@@ -1,11 +1,12 @@
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, BufReader, Read};
+use std::sync::Arc;
 
 use rlayout_core::{
     Array, Cell, CellId, Geometry, Instance, Label, LayerKey, Layout, Path, PathEnds, Point,
-    Transformation, path_contour, validate_contour, validate_polygon,
+    Transformation, path_contour, validate_polygon,
 };
 
 #[derive(Clone, Debug)]
@@ -45,6 +46,24 @@ pub struct LoadResult {
 }
 
 pub fn read(reader: impl Read) -> Result<LoadResult, GdsError> {
+    let mut reader = BufReader::new(reader);
+    let mut prefix = [0; 2];
+    reader.read_exact(&mut prefix).map_err(|error| GdsError {
+        offset: 0,
+        cell: None,
+        element: None,
+        message: format!("Reading input: {error}"),
+    })?;
+    let compressed = prefix == [0x1f, 0x8b];
+    let reader = BufReader::new(std::io::Cursor::new(prefix).chain(reader));
+    if compressed {
+        parse(flate2::bufread::MultiGzDecoder::new(reader))
+    } else {
+        parse(reader)
+    }
+}
+
+fn parse(reader: impl Read) -> Result<LoadResult, GdsError> {
     Parser {
         reader,
         offset: 0,
@@ -53,6 +72,8 @@ pub fn read(reader: impl Read) -> Result<LoadResult, GdsError> {
         element: None,
         warnings: Vec::new(),
         warned: BTreeSet::new(),
+        pending: None,
+        names: HashMap::new(),
     }
     .read_library()
 }
@@ -71,17 +92,30 @@ struct Parser<R> {
     element: Option<&'static str>,
     warnings: Vec<Diagnostic>,
     warned: BTreeSet<u8>,
+    pending: Option<(u64, Record)>,
+    names: HashMap<Vec<u8>, Arc<GdsName>>,
+}
+
+struct GdsName {
+    bytes: Vec<u8>,
+    display: String,
+}
+
+impl fmt::Display for GdsName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.display.fmt(formatter)
+    }
 }
 
 struct DraftCell {
-    name: String,
+    name: Arc<GdsName>,
     shapes: Vec<ShapeOrReference>,
 }
 
 enum ShapeOrReference {
     Shape(rlayout_core::Shape),
     Reference {
-        name: String,
+        name: Arc<GdsName>,
         transformation: Transformation,
         array: Array,
         offset: u64,
@@ -97,7 +131,7 @@ struct Element {
     path_type: Option<u16>,
     beginning: Option<i32>,
     end: Option<i32>,
-    name: Option<String>,
+    name: Option<Arc<GdsName>>,
     text: Option<String>,
     presentation: u16,
     columns: u16,
@@ -126,14 +160,21 @@ impl<R: Read> Parser<R> {
     }
 
     fn next(&mut self) -> Result<Record, GdsError> {
+        if let Some((offset, record)) = self.pending.take() {
+            self.record_offset = offset;
+            return Ok(record);
+        }
         self.record_offset = self.offset;
         let mut header = [0_u8; 4];
         self.reader
             .read_exact(&mut header)
             .map_err(|error| self.error(format!("Reading record header: {error}")))?;
         let length = u16::from_be_bytes([header[0], header[1]]);
-        if length < 4 || length % 2 != 0 {
+        if length < 4 {
             return Err(self.error(format!("Invalid record length {length}")));
+        }
+        if length % 2 != 0 {
+            self.warn(0xff, "Odd record length accepted");
         }
         let mut data = vec![0; usize::from(length) - 4];
         self.reader
@@ -199,20 +240,81 @@ impl<R: Read> Parser<R> {
         real8(&record.data).ok_or_else(|| self.error("Invalid GDS real number"))
     }
 
-    fn string(&self, record: &Record) -> Result<String, GdsError> {
+    fn string(&mut self, record: &Record) -> Result<String, GdsError> {
         self.check(record, 6, None)?;
-        let bytes = record.data.strip_suffix(&[0]).unwrap_or(&record.data);
-        if bytes.iter().any(|byte| !byte.is_ascii() || *byte == 0) {
-            return Err(self.error("Non-ASCII or embedded-NUL strings are unsupported"));
+        let bytes = &record.data[..record
+            .data
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |index| index + 1)];
+        let mut text = String::new();
+        let mut remaining = bytes;
+        while !remaining.is_empty() {
+            match std::str::from_utf8(remaining) {
+                Ok(valid) => {
+                    text.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, invalid) = remaining.split_at(error.valid_up_to());
+                    text.push_str(
+                        std::str::from_utf8(valid)
+                            .map_err(|error| self.error(error.to_string()))?,
+                    );
+                    let length = error.error_len().unwrap_or(invalid.len());
+                    for byte in invalid.iter().take(length) {
+                        use std::fmt::Write;
+                        write!(text, "\\x{byte:02x}")
+                            .map_err(|error| self.error(error.to_string()))?;
+                    }
+                    remaining = &invalid[length..];
+                    self.warn(
+                        0xfe,
+                        "Non-UTF-8 string bytes displayed as hexadecimal escapes",
+                    );
+                }
+            }
         }
-        String::from_utf8(bytes.to_vec()).map_err(|error| self.error(error.to_string()))
+        Ok(text)
+    }
+
+    fn name(&mut self, record: &Record) -> Result<Arc<GdsName>, GdsError> {
+        self.check(record, 6, None)?;
+        let length = record
+            .data
+            .iter()
+            .rposition(|byte| *byte != 0)
+            .map_or(0, |index| index + 1);
+        if let Some(name) = self.names.get(&record.data[..length]) {
+            return Ok(name.clone());
+        }
+        let name = Arc::new(GdsName {
+            bytes: record.data[..length].to_vec(),
+            display: self.string(record)?,
+        });
+        if name.bytes.is_empty() {
+            return Err(self.error("Empty cell name"));
+        }
+        self.names.insert(name.bytes.clone(), name.clone());
+        Ok(name)
+    }
+
+    fn display_name(&mut self, name: &GdsName, used: &mut BTreeSet<String>) -> String {
+        let mut display = name.display.clone();
+        let mut suffix = 1;
+        while !used.insert(display.clone()) {
+            display = format!("{} [name {suffix}]", name.display);
+            suffix += 1;
+            self.warn(0xf9, "Escaped cell display names distinguished; references retain original byte identities");
+        }
+        display
     }
 
     fn read_library(mut self) -> Result<LoadResult, GdsError> {
         let header = self.required(0x00, 2, Some(2))?;
         let version = self.short(&header, 2)?;
         if version > 600 {
-            return Err(self.error(format!("Unsupported GDS version {version}")));
+            self.warn(0x00, format!("GDS version {version} accepted"));
         }
         self.required(0x01, 2, Some(24))?;
         let mut name = None;
@@ -224,12 +326,9 @@ impl<R: Read> Parser<R> {
             match record.kind {
                 0x02 if name.is_none() && drafts.is_empty() => {
                     let library_name = self.string(&record)?;
-                    if library_name.is_empty() {
-                        return Err(self.error("Empty library name"));
-                    }
                     name = Some(library_name);
                 }
-                0x03 if units.is_none() && name.is_some() && drafts.is_empty() => {
+                0x03 if units.is_none() && drafts.is_empty() => {
                     self.check(&record, 5, Some(16))?;
                     let user_units = real8(
                         record
@@ -256,11 +355,11 @@ impl<R: Read> Parser<R> {
                     }
                     units = Some((user_units, meters));
                 }
-                0x05 if name.is_some() && units.is_some() => {
+                0x05 if units.is_some() => {
                     self.check(&record, 2, Some(24))?;
                     let draft = self.read_cell()?;
                     let id = CellId::from_index(drafts.len());
-                    if cell_names.insert(draft.name.clone(), id).is_some() {
+                    if cell_names.insert(draft.name.bytes.clone(), id).is_some() {
                         return Err(
                             self.error(format!("Duplicate cell definition: {}", draft.name))
                         );
@@ -271,16 +370,28 @@ impl<R: Read> Parser<R> {
                     self.check(&record, 0, Some(0))?;
                     break;
                 }
-                0x1f | 0x20 | 0x39 => {
+                0x1f | 0x20 | 0x23 | 0x24 | 0x37 | 0x3a => {
                     self.check(&record, 6, None)?;
                     self.warn(
                         record.kind,
                         format!("Ignored library metadata record 0x{:02x}", record.kind),
                     );
                 }
-                0x22 => {
+                0x22 | 0x39 => {
                     self.short(&record, 2)?;
                     self.warn(record.kind, "Ignored library generation metadata");
+                }
+                0x36 => {
+                    self.short(&record, 2)?;
+                    self.warn(record.kind, "Ignored library format metadata");
+                }
+                0x38 => self.check(&record, 0, Some(0))?,
+                0x2b => {
+                    self.short(&record, 2)?;
+                    self.warn(0x2b, "Library and cell properties are not retained");
+                }
+                0x2c => {
+                    self.string(&record)?;
                 }
                 _ => {
                     return Err(self.error(format!(
@@ -290,9 +401,29 @@ impl<R: Read> Parser<R> {
                 }
             }
         }
-        let name = name.ok_or_else(|| self.error("Missing library name"))?;
+        let name = name.unwrap_or_default();
         let (user_units, meters) = units.ok_or_else(|| self.error("Missing database units"))?;
+        let mut missing = Vec::new();
+        for draft in &drafts {
+            for entry in &draft.shapes {
+                if let ShapeOrReference::Reference { name, offset, .. } = entry
+                    && !cell_names.contains_key(name.bytes.as_slice())
+                {
+                    let id = CellId::from_index(drafts.len() + missing.len());
+                    cell_names.insert(name.bytes.clone(), id);
+                    missing.push(name.clone());
+                    self.warnings.push(Diagnostic {
+                        offset: *offset,
+                        cell: Some(draft.name.display.clone()),
+                        message: format!(
+                            "Unresolved reference to {name} retained as an empty cell"
+                        ),
+                    });
+                }
+            }
+        }
         let mut cells = Vec::with_capacity(drafts.len());
+        let mut display_names = BTreeSet::new();
         for draft in drafts {
             let mut shapes = Vec::new();
             let mut instances = Vec::new();
@@ -305,12 +436,16 @@ impl<R: Read> Parser<R> {
                         array,
                         offset,
                     } => {
-                        let cell = cell_names.get(&name).copied().ok_or_else(|| GdsError {
-                            offset,
-                            cell: Some(draft.name.clone()),
-                            element: Some("reference"),
-                            message: format!("Unresolved reference to {name}"),
-                        })?;
+                        let cell =
+                            cell_names
+                                .get(name.bytes.as_slice())
+                                .copied()
+                                .ok_or_else(|| GdsError {
+                                    offset,
+                                    cell: Some(draft.name.display.clone()),
+                                    element: Some("reference"),
+                                    message: format!("Unresolved reference to {name}"),
+                                })?;
                         instances.push(Instance {
                             cell,
                             transformation,
@@ -319,7 +454,18 @@ impl<R: Read> Parser<R> {
                     }
                 }
             }
-            cells.push(Cell::new(draft.name, shapes, instances));
+            cells.push(Cell::new(
+                self.display_name(&draft.name, &mut display_names),
+                shapes,
+                instances,
+            ));
+        }
+        for name in missing {
+            cells.push(Cell::new(
+                self.display_name(&name, &mut display_names),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
         let layout = Layout::new(name, meters, user_units, cells)
             .map_err(|error| self.error(error.to_string()))?;
@@ -337,7 +483,7 @@ impl<R: Read> Parser<R> {
                 .get(..length)
                 .is_some_and(|data| data.iter().any(|byte| *byte != 0))
             {
-                return Err(self.error("Nonzero data after ENDLIB is unsupported"));
+                self.warn(0xfd, "Nonzero trailing data after ENDLIB ignored");
             }
         }
         Ok(LoadResult {
@@ -348,11 +494,11 @@ impl<R: Read> Parser<R> {
 
     fn read_cell(&mut self) -> Result<DraftCell, GdsError> {
         let name_record = self.required(0x06, 6, None)?;
-        let name = self.string(&name_record)?;
-        if name.is_empty() {
+        let name = self.name(&name_record)?;
+        if name.bytes.is_empty() {
             return Err(self.error("Empty cell name"));
         }
-        self.cell = Some(name.clone());
+        self.cell = Some(name.display.clone());
         let mut shapes = Vec::new();
         loop {
             let record = self.next()?;
@@ -366,6 +512,37 @@ impl<R: Read> Parser<R> {
                     if let Some(element) = self.read_element(record.kind)? {
                         shapes.push(element);
                     }
+                }
+                0x15 => {
+                    self.check(&record, 0, Some(0))?;
+                    self.warn(0x15, "NODE elements ignored");
+                    loop {
+                        let record = self.next()?;
+                        if record.kind == 0x11 {
+                            self.check(&record, 0, Some(0))?;
+                            break;
+                        }
+                        if matches!(record.kind, 0x07..=0x0c | 0x15 | 0x2d) {
+                            self.warn(0xfc, "Missing ENDEL assumed");
+                            self.pending = Some((self.record_offset, record));
+                            break;
+                        }
+                    }
+                }
+                0x2b => {
+                    self.short(&record, 2)?;
+                    self.warn(0x2b, "Library and cell properties are not retained");
+                }
+                0x2c => {
+                    self.string(&record)?;
+                }
+                0x25 => {
+                    self.short(&record, 2)?;
+                    self.warn(0x25, "Structure type metadata ignored");
+                }
+                0x34 => {
+                    self.short(&record, 1)?;
+                    self.warn(0x34, "Structure class metadata ignored");
                 }
                 _ => {
                     return Err(self.error(format!(
@@ -398,6 +575,14 @@ impl<R: Read> Parser<R> {
         let mut property_pending = false;
         loop {
             let record = self.next()?;
+            if matches!(record.kind, 0x07..=0x0c | 0x15 | 0x2d) {
+                if property_pending {
+                    return Err(self.error("PROPATTR lacks a PROPVALUE"));
+                }
+                self.warn(0xfc, "Missing ENDEL assumed");
+                self.pending = Some((self.record_offset, record));
+                break;
+            }
             if record.kind == 0x11 {
                 self.check(&record, 0, Some(0))?;
                 if property_pending {
@@ -405,7 +590,10 @@ impl<R: Read> Parser<R> {
                 }
                 break;
             }
-            if !matches!(record.kind, 0x2b | 0x2c) && !seen.insert(record.kind) {
+            if !matches!(record.kind, 0x2b | 0x2c)
+                && !seen.insert(record.kind)
+                && !(record.kind == 0x10 && matches!(kind, 0x08 | 0x09))
+            {
                 return Err(self.error(format!(
                     "Duplicate record 0x{:02x}; multiple XY records are unsupported",
                     record.kind
@@ -461,9 +649,9 @@ impl<R: Read> Parser<R> {
                             ))
                         })
                         .collect::<Result<Vec<_>, GdsError>>()?;
-                    element.points = Some(points);
+                    element.points.get_or_insert_with(Vec::new).extend(points);
                 }
-                0x12 => element.name = Some(self.string(&record)?),
+                0x12 => element.name = Some(self.name(&record)?),
                 0x13 => {
                     self.check(&record, 2, Some(4))?;
                     let columns: [u8; 2] = record
@@ -480,20 +668,16 @@ impl<R: Read> Parser<R> {
                         .map_err(|_| self.error("Invalid rows"))?;
                     element.columns = u16::from_be_bytes(columns);
                     element.rows = u16::from_be_bytes(rows);
-                    if element.columns == 0
-                        || element.rows == 0
-                        || element.columns > i16::MAX as u16
-                        || element.rows > i16::MAX as u16
-                    {
-                        return Err(
-                            self.error("Array counts must be positive signed 16-bit integers")
-                        );
+                    if element.columns == 0 || element.rows == 0 {
+                        self.warn(0x13, "Zero AREF counts interpreted as one");
+                        element.columns = element.columns.max(1);
+                        element.rows = element.rows.max(1);
                     }
                 }
                 0x17 => {
                     element.presentation = self.short(&record, 1)?;
                     if element.presentation & !0x003f != 0 {
-                        return Err(self.error("Reserved TEXT presentation bits are unsupported"));
+                        self.warn(0x17, "Reserved TEXT presentation bits ignored");
                     }
                     if element.presentation & 0x30 != 0 {
                         self.warn(
@@ -506,7 +690,7 @@ impl<R: Read> Parser<R> {
                 0x1a => {
                     let flags = self.short(&record, 1)?;
                     if flags & !0x8000 != 0 {
-                        return Err(self.error("Absolute or reserved STRANS flags are unsupported"));
+                        self.warn(0x1a, "Absolute or reserved STRANS flags ignored; relative transformation used");
                     }
                     element.transformation.reflected = flags & 0x8000 != 0;
                 }
@@ -546,8 +730,12 @@ impl<R: Read> Parser<R> {
             .take()
             .ok_or_else(|| self.error("Missing XY record"))?;
         let result = if matches!(kind, 0x0a | 0x0b) {
-            if (kind == 0x0a && points.len() != 1) || (kind == 0x0b && points.len() != 3) {
+            let expected = if kind == 0x0a { 1 } else { 3 };
+            if points.len() < expected {
                 return Err(self.error("Reference has an invalid number of XY points"));
+            }
+            if points.len() > expected {
+                self.warn(kind, "Extra reference XY points ignored");
             }
             if kind == 0x0b && !seen.contains(&0x13) {
                 return Err(self.error("Missing COLROW record"));
@@ -616,9 +804,6 @@ impl<R: Read> Parser<R> {
                     Geometry::Polygon(points)
                 }
                 0x2d => {
-                    if points.len() != 5 || points.first() != points.last() {
-                        return Err(self.error("BOX must contain five closed XY points"));
-                    }
                     let minimum = Point::new(
                         points
                             .iter()
@@ -643,37 +828,16 @@ impl<R: Read> Parser<R> {
                             .max()
                             .ok_or_else(|| self.error("Empty BOX"))?,
                     );
-                    let unique: BTreeSet<_> = points
-                        .iter()
-                        .take(4)
-                        .map(|point| (point.x, point.y))
-                        .collect();
-                    if minimum.x == maximum.x
-                        || minimum.y == maximum.y
-                        || unique.len() != 4
-                        || points.iter().any(|point| {
-                            (point.x != minimum.x && point.x != maximum.x)
-                                || (point.y != minimum.y && point.y != maximum.y)
-                        })
-                        || points
-                            .windows(2)
-                            .any(|pair| match (pair.first(), pair.get(1)) {
-                                (Some(first), Some(second)) => {
-                                    first.x != second.x && first.y != second.y
-                                }
-                                _ => true,
-                            })
-                    {
-                        return Err(self.error("BOX must be an axis-aligned rectangle"));
+                    if minimum.x == maximum.x || minimum.y == maximum.y {
+                        self.warn(0x2d, "Empty BOX ignored");
+                        self.element = None;
+                        return Ok(None);
                     }
                     Geometry::Box { minimum, maximum }
                 }
                 0x09 => {
                     let path_type = element.path_type.unwrap_or(0);
-                    if path_type != 4 && (element.beginning.is_some() || element.end.is_some()) {
-                        return Err(self.error("Explicit extensions require PATHTYPE 4"));
-                    }
-                    let ends = match path_type {
+                    let mut ends = match path_type {
                         0 => PathEnds::Flush,
                         1 => PathEnds::Round,
                         2 => PathEnds::Square,
@@ -681,40 +845,71 @@ impl<R: Read> Parser<R> {
                             beginning: i64::from(element.beginning.unwrap_or(0)),
                             end: i64::from(element.end.unwrap_or(0)),
                         },
-                        _ => return Err(self.error(format!("Unsupported PATHTYPE {path_type}"))),
+                        _ => {
+                            self.warn(
+                                0x21,
+                                format!("Unsupported PATHTYPE {path_type}; flush ends used"),
+                            );
+                            PathEnds::Flush
+                        }
                     };
                     let width = element.width.unwrap_or(0);
+                    if element.beginning.is_some() || element.end.is_some() {
+                        let default = if matches!(path_type, 1 | 2) {
+                            i64::from(width.unsigned_abs()) / 2
+                        } else {
+                            0
+                        };
+                        ends = PathEnds::Extended {
+                            beginning: element.beginning.map_or(default, i64::from),
+                            end: element.end.map_or(default, i64::from),
+                        };
+                        if path_type == 1 {
+                            self.warn(
+                                0x30,
+                                "Round PATH with explicit extensions uses extended ends",
+                            );
+                        }
+                    }
+                    let mut points = points;
+                    points.dedup();
+                    if points.is_empty() {
+                        self.warn(0x09, "Empty PATH ignored");
+                        self.element = None;
+                        return Ok(None);
+                    }
+                    if points.len() == 1 {
+                        self.warn(0x09, "Single-point PATH accepted");
+                    }
                     let path = Path {
                         points,
                         width: u64::from(width.unsigned_abs()),
                         absolute_width: width < 0,
                         ends,
                     };
-                    if path.points.is_empty()
-                        || (path.points.len() < 2 && path.ends != PathEnds::Round)
-                        || path
-                            .points
-                            .windows(2)
-                            .any(|pair| pair.first() == pair.get(1))
-                    {
-                        return Err(self.error("PATH has too few or repeated points"));
-                    }
-                    let contour =
-                        path_contour(&path, 1.0).map_err(|error| self.error(error.to_string()))?;
-                    if !contour.is_empty() {
-                        validate_contour(&contour)
-                            .map_err(|error| self.error(error.to_string()))?;
-                    }
+                    path_contour(&path, 1.0).map_err(|error| self.error(error.to_string()))?;
                     Geometry::Path(path)
                 }
                 0x0c => {
-                    if points.len() != 1 {
-                        return Err(self.error("TEXT must contain one XY point"));
+                    if points.is_empty() {
+                        return Err(self.error("TEXT must contain an XY point"));
                     }
-                    let horizontal_alignment = (element.presentation & 3) as u8;
-                    let vertical_alignment = ((element.presentation >> 2) & 3) as u8;
+                    if points.len() > 1 {
+                        self.warn(0x0c, "Extra TEXT XY points ignored");
+                    }
+                    let mut horizontal_alignment = (element.presentation & 3) as u8;
+                    let mut vertical_alignment = ((element.presentation >> 2) & 3) as u8;
                     if horizontal_alignment > 2 || vertical_alignment > 2 {
-                        return Err(self.error("Invalid TEXT alignment"));
+                        self.warn(
+                            0x17,
+                            "Invalid TEXT alignment defaults to the first alignment",
+                        );
+                        if horizontal_alignment > 2 {
+                            horizontal_alignment = 0;
+                        }
+                        if vertical_alignment > 2 {
+                            vertical_alignment = 0;
+                        }
                     }
                     element.transformation.translation = points
                         .first()

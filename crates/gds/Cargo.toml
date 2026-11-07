@@ -10,6 +10,7 @@ path = "src/gds.rs"
 
 [dependencies]
 rlayout-core.workspace = true
+flate2.workspace = true
 
 [lints]
 workspace = true

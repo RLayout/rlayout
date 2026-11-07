@@ -1955,6 +1955,7 @@ version = "0.1.0"
 name = "rlayout-gds"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "rlayout-core",
 ]
 

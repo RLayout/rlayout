@@ -70,6 +70,35 @@ fn culls_offscreen_hierarchy_and_respects_depth_and_layers() -> Result<(), Box<d
 }
 
 #[test]
+fn completed_canvas_removes_coarse_preview_textures() -> Result<(), Box<dyn Error>> {
+    let mut viewer = Viewer::new(scene_with_instances()?);
+    let context = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let mut output = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(520.0, 280.0))),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| viewer.canvas(ui));
+            },
+        );
+        output.textures_delta.clear();
+        if viewer.rendering_complete() {
+            let frame = viewer.frame.as_ref().ok_or("Missing completed frame")?;
+            assert!(!frame.1.tiles.is_empty());
+            assert!(frame.1.tiles.iter().all(|tile| !tile.preview));
+            assert!(viewer.tile_textures.iter().all(|(_, _, preview)| !preview));
+            assert_eq!(viewer.tile_textures.len(), frame.1.tiles.len());
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    Err("Canvas rendering did not complete".into())
+}
+
+#[test]
 fn array_culling_never_omits_a_visible_element() {
     let element = Bounds {
         minimum: DoublePoint::new(-2.0, -3.0),
@@ -425,7 +454,7 @@ fn nonzero_winding_fills_the_center_of_a_self_intersecting_star() -> Result<(), 
 }
 
 #[test]
-fn absolute_path_revalidation_reports_shape_context() -> Result<(), Box<dyn Error>> {
+fn absolute_paths_accept_overlapping_enlarged_contours() -> Result<(), Box<dyn Error>> {
     let path = Path {
         points: vec![
             Point::new(0, 0),
@@ -468,15 +497,12 @@ fn absolute_path_revalidation_reports_shape_context() -> Result<(), Box<dyn Erro
         ],
     )?;
     let mut viewer = Viewer::new(Scene::prepare(layout)?);
-    let error = viewer
-        .render(
-            &egui::Context::default(),
-            Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
-        )
-        .err()
-        .ok_or("Expected an invalid enlarged path contour")?;
-    assert!(error.0.contains("Cell LEAF, layer 7/2, shape 1"));
-    assert!(error.0.contains("contours"));
+    let frame = viewer.render(
+        &egui::Context::default(),
+        Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
+    )?;
+    assert_eq!(frame.shape_count, 1);
+    assert!(frame.complete);
     Ok(())
 }
 
