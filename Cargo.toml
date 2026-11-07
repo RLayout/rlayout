@@ -1,0 +1,28 @@
+[workspace]
+members = ["crates/core", "crates/gds", "crates/viewer", "crates/app"]
+default-members = ["crates/app"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace.dependencies]
+rlayout-core = { path = "crates/core" }
+rlayout-gds = { path = "crates/gds" }
+rlayout-viewer = { path = "crates/viewer" }
+egui = { version = "=0.36.0", default-features = false, features = ["default_fonts"] }
+eframe = { version = "=0.36.0", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland"] }
+tess2-rust = "1.2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+debug = 1

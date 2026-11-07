@@ -1,0 +1,18 @@
+[package]
+name = "rlayout-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "rlayout"
+path = "src/main.rs"
+
+[dependencies]
+rlayout-gds.workspace = true
+rlayout-viewer.workspace = true
+eframe.workspace = true
+
+[lints]
+workspace = true

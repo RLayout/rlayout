@@ -1,0 +1,12 @@
+[package]
+name = "rlayout-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/core.rs"
+
+[lints]
+workspace = true
