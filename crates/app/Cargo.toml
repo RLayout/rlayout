@@ -13,6 +13,7 @@ path = "src/main.rs"
 rlayout-gds.workspace = true
 rlayout-viewer.workspace = true
 eframe.workspace = true
+pollster.workspace = true
 
 [lints]
 workspace = true

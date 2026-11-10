@@ -1,16 +1,35 @@
 pub use egui;
 
+mod gpu;
+mod prepare;
+mod spatial;
+
+#[cfg(test)]
+mod gpu_tests;
+#[cfg(test)]
 mod raster;
+
+pub use gpu::{GpuRendererHandle, RenderStatus};
 
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
 
-use egui::{Color32, Pos2, Rect, Vec2, epaint::Mesh};
+#[cfg(test)]
+use egui::epaint::Mesh;
+use egui::{Color32, Pos2, Rect, Vec2};
+#[cfg(test)]
+use rlayout_core::Path;
 use rlayout_core::{
-    Bounds, CellId, DoublePoint, Geometry, Label, LayerKey, Layout, Path, Transformation,
-    path_contour, shape_bounds,
+    Bounds, CellId, DoublePoint, Geometry, Label, LayerKey, Layout, Transformation, path_contour,
+    shape_bounds,
 };
 use tess2_rust::{ElementType, TessStatus, Tessellator, WindingRule};
 
@@ -98,6 +117,7 @@ struct Polygon {
     bounds: Bounds,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum PreparedGeometry {
     Polygon(Polygon),
@@ -106,6 +126,7 @@ enum PreparedGeometry {
     Label(Label),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct PreparedShape {
     layer: LayerKey,
@@ -115,19 +136,31 @@ struct PreparedShape {
 #[derive(Debug)]
 pub struct Scene {
     layout: Layout,
+    revision: u64,
+    #[cfg(test)]
     shapes: HashMap<CellId, OnceLock<Vec<PreparedShape>>>,
-    indexes: HashMap<CellId, raster::SpatialIndex>,
+    indexes: HashMap<CellId, spatial::SpatialIndex>,
     label_metrics: Vec<(f64, f64)>,
+    #[cfg(test)]
     label_margin: f64,
 }
 
 impl Scene {
     pub fn prepare(layout: Layout) -> Result<Self, ViewError> {
+        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        let revision = NEXT_REVISION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+                revision.checked_add(1)
+            })
+            .map_err(|_| ViewError("Too many document revisions".into()))?;
+        #[cfg(test)]
         let mut shapes = HashMap::new();
         let mut indexes = HashMap::new();
         let mut label_metrics = vec![(0.0_f64, 0.0_f64); layout.cells().count()];
+        #[cfg(test)]
         let mut label_margin = 0.0_f64;
         for (id, cell) in layout.cells() {
+            #[cfg(test)]
             shapes.insert(id, OnceLock::new());
             for shape in cell.shapes() {
                 if let Geometry::Label(label) = &shape.geometry {
@@ -137,8 +170,11 @@ impl Scene {
                     label_metrics[id.index()].1 = label_metrics[id.index()]
                         .1
                         .max(label.transformation.magnification);
-                    label_margin =
-                        label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
+                    #[cfg(test)]
+                    {
+                        label_margin =
+                            label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
+                    }
                 }
             }
         }
@@ -165,17 +201,21 @@ impl Scene {
             }
         }
         for (id, _) in layout.cells() {
-            indexes.insert(id, raster::SpatialIndex::new(&layout, id, &label_metrics)?);
+            indexes.insert(id, spatial::SpatialIndex::new(&layout, id, &label_metrics)?);
         }
         Ok(Self {
             layout,
+            revision,
+            #[cfg(test)]
             shapes,
             indexes,
             label_metrics,
+            #[cfg(test)]
             label_margin,
         })
     }
 
+    #[cfg(test)]
     fn prepared(&self, id: CellId) -> Result<&[PreparedShape], ViewError> {
         let destination = self
             .shapes
@@ -297,6 +337,7 @@ fn triangulate(points: Vec<DoublePoint>) -> Result<Polygon, ViewError> {
     })
 }
 
+#[cfg(test)]
 fn triangulate_path(path: &Path, magnification: f64) -> Result<Polygon, ViewError> {
     let points = path_contour(path, magnification).map_err(|error| ViewError(error.to_string()))?;
     if points.len() < 3 {
@@ -325,6 +366,7 @@ pub struct LayerStyle {
     pub color: Color32,
 }
 
+#[cfg(test)]
 pub struct RenderedTile {
     pub rect: Rect,
     pub texture: egui::TextureId,
@@ -335,8 +377,10 @@ pub struct RenderedImage {
     pub image: egui::ColorImage,
     pub shape_count: usize,
     pub cache_bytes: usize,
+    pub statistics: RenderStatus,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub struct RenderedFrame {
     pub meshes: Vec<Arc<Mesh>>,
@@ -365,17 +409,18 @@ pub struct Viewer {
     pub hierarchy_depth: u16,
     pub styles: BTreeMap<LayerKey, LayerStyle>,
     fit_pending: bool,
-    frame: Option<(FrameKey, RenderedFrame)>,
+    #[cfg(test)]
     absolute_paths: HashMap<(CellId, usize, u64), Polygon>,
     pub cursor: Option<DoublePoint>,
     pub error: Option<String>,
-    raster: raster::Worker,
-    raster_key: Option<FrameKey>,
-    tile_textures: Vec<(Rect, egui::TextureHandle, bool)>,
+    renderer: gpu::RenderSession,
+    requested: Option<FrameKey>,
+    changed_at: Instant,
+    exact_requested: bool,
 }
 
 impl Viewer {
-    pub fn new(scene: Scene) -> Self {
+    pub fn new(scene: Scene, renderer: GpuRendererHandle) -> Result<Self, ViewError> {
         let selected = scene.layout.top_cells().first().copied();
         let palette = [
             Color32::from_rgb(91, 174, 229),
@@ -404,21 +449,24 @@ impl Viewer {
                 )
             })
             .collect();
-        Self {
-            scene: Arc::new(scene),
+        let scene = Arc::new(scene);
+        let renderer = renderer.create_session(scene.clone())?;
+        Ok(Self {
+            scene,
             camera: Camera::default(),
             selected,
             hierarchy_depth: u16::MAX,
             styles,
             fit_pending: true,
-            frame: None,
+            #[cfg(test)]
             absolute_paths: HashMap::new(),
             cursor: None,
             error: None,
-            raster: raster::Worker::new(),
-            raster_key: None,
-            tile_textures: Vec::new(),
-        }
+            renderer,
+            requested: None,
+            changed_at: Instant::now(),
+            exact_requested: false,
+        })
     }
     pub fn layout(&self) -> &Layout {
         &self.scene.layout
@@ -553,63 +601,36 @@ impl Viewer {
             styles: self.styles.clone(),
             text_pass: 0,
         };
-        if self.raster_key.as_ref() != Some(&key) {
-            self.raster_key = Some(key.clone());
-            self.tile_textures.clear();
-            self.frame = Some((key.clone(), RenderedFrame::default()));
+        if self.requested.as_ref() != Some(&key) {
+            self.requested = Some(key.clone());
+            self.changed_at = Instant::now();
+            self.exact_requested = false;
             self.error = self
-                .raster
-                .start(self.scene.clone(), key.clone(), ui.ctx().clone())
+                .renderer
+                .request(key.clone(), ui.ctx().clone(), true)
                 .err()
                 .map(|error| error.to_string());
         }
-        for message in self.raster.receive() {
-            match message {
-                Ok(tile) => {
-                    if let Some((_, frame)) = &mut self.frame {
-                        if tile.first {
-                            frame.shape_count = 0;
-                            frame.tiles.clear();
-                        }
-                        if tile.preview {
-                            self.tile_textures.clear();
-                        }
-                        frame.shape_count = frame.shape_count.saturating_add(tile.shape_count);
-                        frame.complete = tile.complete;
-                        let texture = ui.ctx().load_texture(
-                            "layout-tile",
-                            tile.image,
-                            egui::TextureOptions::NEAREST,
-                        );
-                        frame.tiles.push(RenderedTile {
-                            rect: tile.rect,
-                            texture: texture.id(),
-                            preview: tile.preview,
-                        });
-                        self.tile_textures.push((tile.rect, texture, tile.preview));
-                        if tile.complete {
-                            self.tile_textures.retain(|(_, _, preview)| !preview);
-                            frame.tiles.retain(|tile| !tile.preview);
-                        }
-                    }
-                }
-                Err(error) => self.error = Some(error.to_string()),
-            }
-        }
-        for (rect, texture, _) in &self.tile_textures {
-            painter.image(
-                texture.id(),
-                *rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
-        if let Some((_, frame)) = &self.frame
-            && !frame.complete
-            && self.error.is_none()
-        {
+        let quiet = self.changed_at.elapsed();
+        if !self.exact_requested {
             ui.ctx()
-                .request_repaint_after(std::time::Duration::from_millis(16));
+                .request_repaint_after(Duration::from_millis(150).saturating_sub(quiet));
+        }
+        if !self.exact_requested && quiet >= Duration::from_millis(150) {
+            self.exact_requested = true;
+            self.error = self
+                .renderer
+                .request(key, ui.ctx().clone(), false)
+                .err()
+                .map(|error| error.to_string());
+        }
+        painter.add(self.renderer.callback(viewport, self.camera));
+        let status = self.renderer.status();
+        if let Some(error) = status.error {
+            self.error = Some(error);
+        }
+        if !status.complete && self.error.is_none() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
         if self.selected.is_none() {
             painter.text(
@@ -631,35 +652,39 @@ impl Viewer {
         }
     }
     pub fn rendering_complete(&self) -> bool {
-        self.frame.as_ref().is_some_and(|(_, frame)| frame.complete)
+        self.exact_requested && self.renderer.status().complete
     }
 
-    pub fn render_image(
-        &self,
+    pub fn render_status(&self) -> RenderStatus {
+        self.renderer.status()
+    }
+
+    pub async fn render_image(
+        &mut self,
         context: &egui::Context,
         viewport: Rect,
     ) -> Result<RenderedImage, ViewError> {
-        raster::capture(
-            self.scene.clone(),
-            FrameKey {
-                camera: self.camera,
-                viewport,
-                pixels_per_point: context.pixels_per_point(),
-                selected: self.selected,
-                depth: self.hierarchy_depth,
-                styles: self.styles.clone(),
-                text_pass: 0,
-            },
-            context.clone(),
-        )
+        self.renderer
+            .capture(
+                FrameKey {
+                    camera: self.camera,
+                    viewport,
+                    pixels_per_point: context.pixels_per_point(),
+                    selected: self.selected,
+                    depth: self.hierarchy_depth,
+                    styles: self.styles.clone(),
+                    text_pass: 0,
+                },
+                context.clone(),
+            )
+            .await
     }
 
     pub fn visible_shape_count(&self) -> usize {
-        self.frame
-            .as_ref()
-            .map_or(0, |(_, frame)| frame.shape_count)
+        self.renderer.status().shape_count
     }
 
+    #[cfg(test)]
     pub fn render(
         &mut self,
         context: &egui::Context,
@@ -918,6 +943,7 @@ fn hierarchy_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn paint_polygon(
     mesh: &mut Mesh,
     polygon: &Polygon,
@@ -958,6 +984,7 @@ fn paint_polygon(
     Ok(true)
 }
 
+#[cfg(test)]
 fn paint_label(
     mesh: &mut Mesh,
     context: &egui::Context,
@@ -1080,3 +1107,16 @@ fn projected_range(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn test_renderer() -> Result<GpuRendererHandle, ViewError> {
+    static RENDERER: std::sync::OnceLock<Result<GpuRendererHandle, String>> =
+        std::sync::OnceLock::new();
+    RENDERER
+        .get_or_init(|| {
+            pollster::block_on(GpuRendererHandle::headless()).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| ViewError(error.clone()))
+}

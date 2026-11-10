@@ -11,6 +11,9 @@ path = "src/viewer.rs"
 [dependencies]
 rlayout-core.workspace = true
 egui.workspace = true
+egui-wgpu.workspace = true
+bytemuck.workspace = true
+pollster.workspace = true
 tess2-rust.workspace = true
 
 [lints]

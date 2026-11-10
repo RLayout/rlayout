@@ -1943,6 +1943,7 @@ name = "rlayout-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "pollster",
  "rlayout-gds",
  "rlayout-viewer",
 ]
@@ -1963,7 +1964,10 @@ dependencies = [
 name = "rlayout-viewer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "egui",
+ "egui-wgpu",
+ "pollster",
  "rlayout-core",
  "tess2-rust",
 ]

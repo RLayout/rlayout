@@ -1,270 +1,9 @@
 use super::*;
-use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::thread::{self, JoinHandle};
+use crate::spatial::*;
 
-const TILE_SIZE: usize = 256;
-const CACHE_BYTES: usize = 128 * 1024 * 1024;
+const REFERENCE_MEMORY_LIMIT: usize = 128 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug)]
-struct Entry {
-    bounds: Bounds,
-    index: usize,
-    instance: bool,
-    labels: (f64, f64),
-}
-
-#[derive(Debug)]
-struct Node {
-    bounds: Bounds,
-    range: std::ops::Range<usize>,
-    children: Option<(usize, usize)>,
-    labels: (f64, f64),
-}
-
-#[derive(Debug)]
-pub(super) struct SpatialIndex {
-    entries: Vec<Entry>,
-    nodes: Vec<Node>,
-}
-
-impl SpatialIndex {
-    pub(super) fn new(
-        layout: &Layout,
-        id: CellId,
-        labels: &[(f64, f64)],
-    ) -> Result<Self, ViewError> {
-        let cell = layout
-            .cell(id)
-            .ok_or_else(|| ViewError("Missing indexed cell".into()))?;
-        let mut entries = Vec::with_capacity(cell.shapes().len() + cell.instances().len());
-        for (index, shape) in cell.shapes().iter().enumerate() {
-            if let Some(bounds) = shape_bounds(&shape.geometry).map_err(|error| {
-                shape_error(
-                    cell.name(),
-                    shape.layer,
-                    index,
-                    ViewError(error.to_string()),
-                )
-            })? {
-                entries.push(Entry {
-                    bounds,
-                    index,
-                    instance: false,
-                    labels: match &shape.geometry {
-                        Geometry::Label(label) => (
-                            label.text.chars().count() as f64,
-                            label.transformation.magnification,
-                        ),
-                        _ => (0.0, 0.0),
-                    },
-                });
-            }
-        }
-        for (index, instance) in cell.instances().iter().enumerate() {
-            if let Some(bounds) = layout.transformed_bounds(instance.cell, instance.transformation)
-            {
-                entries.push(Entry {
-                    bounds: instance.array.bounds(bounds),
-                    index,
-                    instance: true,
-                    labels: (
-                        labels[instance.cell.index()].0,
-                        labels[instance.cell.index()].1 * instance.transformation.magnification,
-                    ),
-                });
-            }
-        }
-        let mut result = Self {
-            entries,
-            nodes: Vec::new(),
-        };
-        if !result.entries.is_empty() {
-            result.build(0..result.entries.len());
-        }
-        Ok(result)
-    }
-
-    fn build(&mut self, range: std::ops::Range<usize>) -> usize {
-        let bounds = self.entries[range.clone()]
-            .iter()
-            .map(|entry| entry.bounds)
-            .reduce(Bounds::union)
-            .unwrap_or(Bounds {
-                minimum: DoublePoint::default(),
-                maximum: DoublePoint::default(),
-            });
-        let index = self.nodes.len();
-        self.nodes.push(Node {
-            bounds,
-            range: range.clone(),
-            children: None,
-            labels: self.entries[range.clone()]
-                .iter()
-                .fold((0.0_f64, 0.0_f64), |summary, entry| {
-                    (summary.0.max(entry.labels.0), summary.1.max(entry.labels.1))
-                }),
-        });
-        if range.len() > 32 {
-            let middle = range.start + range.len() / 2;
-            let horizontal = bounds.width() >= bounds.height();
-            self.entries[range.clone()].select_nth_unstable_by(
-                middle - range.start,
-                |first, second| {
-                    let first = first.bounds.center();
-                    let second = second.bounds.center();
-                    if horizontal {
-                        first.x.total_cmp(&second.x)
-                    } else {
-                        first.y.total_cmp(&second.y)
-                    }
-                },
-            );
-            let left = self.build(range.start..middle);
-            let right = self.build(middle..range.end);
-            self.nodes[index].children = Some((left, right));
-        }
-        index
-    }
-
-    fn query(&self) -> Query {
-        Query {
-            stack: if self.nodes.is_empty() {
-                Vec::new()
-            } else {
-                vec![0]
-            },
-            range: 0..0,
-        }
-    }
-}
-
-struct Query {
-    stack: Vec<usize>,
-    range: std::ops::Range<usize>,
-}
-
-impl Query {
-    fn next(
-        &mut self,
-        index: &SpatialIndex,
-        target: Bounds,
-        magnification: f64,
-        units_per_point: f64,
-    ) -> Option<Entry> {
-        loop {
-            for offset in self.range.by_ref() {
-                if let Some(entry) = index.entries.get(offset).filter(|entry| {
-                    entry
-                        .bounds
-                        .expanded(label_margin(entry.labels, magnification, units_per_point))
-                        .intersects(target)
-                }) {
-                    return Some(*entry);
-                }
-            }
-            let node = index.nodes.get(self.stack.pop()?)?;
-            if node
-                .bounds
-                .expanded(label_margin(node.labels, magnification, units_per_point))
-                .intersects(target)
-            {
-                if let Some((left, right)) = node.children {
-                    self.stack.extend([right, left]);
-                } else {
-                    self.range = node.range.clone();
-                }
-            }
-        }
-    }
-}
-
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-struct CacheKey {
-    cell: CellId,
-    angle: u64,
-    magnification: u64,
-    scale: u64,
-    font_scale: u64,
-    reflected: bool,
-    depth: u16,
-    layers: u64,
-}
-
-struct Coverage {
-    width: usize,
-    height: usize,
-    runs: BTreeMap<LayerKey, Vec<Run>>,
-    shape_count: usize,
-}
-
-struct Run {
-    row: usize,
-    start: usize,
-    pixels: Vec<u8>,
-}
-
-impl Coverage {
-    fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + 2 * std::mem::size_of::<CacheKey>()
-            + self.runs.len() * 128
-            + self
-                .runs
-                .values()
-                .map(|runs| {
-                    runs.capacity() * std::mem::size_of::<Run>()
-                        + runs.iter().map(|run| run.pixels.capacity()).sum::<usize>()
-                })
-                .sum::<usize>()
-    }
-
-    fn new(
-        width: usize,
-        height: usize,
-        masks: BTreeMap<LayerKey, Vec<u8>>,
-        shape_count: usize,
-    ) -> Self {
-        let mut layers = BTreeMap::new();
-        for (layer, mask) in masks {
-            let mut runs = Vec::new();
-            for (row, pixels) in mask.chunks(width).enumerate() {
-                let mut start = 0;
-                while start < pixels.len() {
-                    if pixels[start] == 0 {
-                        start += 1;
-                        continue;
-                    }
-                    let mut end = start + 1;
-                    while end < pixels.len() && pixels[end] != 0 {
-                        end += 1;
-                    }
-                    runs.push(Run {
-                        row,
-                        start,
-                        pixels: pixels[start..end].to_vec(),
-                    });
-                    start = end;
-                }
-            }
-            layers.insert(layer, runs);
-        }
-        Self {
-            width,
-            height,
-            runs: layers,
-            shape_count,
-        }
-    }
-}
-
-#[derive(Clone, Hash, PartialEq, Eq)]
-struct GlyphKey {
+struct GlyphRequest {
     text: String,
     size: u64,
     pixels_per_point: u32,
@@ -277,183 +16,28 @@ struct Glyph {
     alpha: Vec<u8>,
 }
 
-impl Glyph {
-    fn bytes(&self, key: &GlyphKey) -> usize {
-        self.alpha.capacity()
-            + std::mem::size_of::<Self>()
-            + 2 * (std::mem::size_of::<GlyphKey>() + key.text.capacity())
-            + 128
-    }
-}
-
-enum CacheEntry {
-    Cell(CacheKey),
-    Glyph(GlyphKey),
-}
-
-struct Cache {
-    entries: HashMap<CacheKey, Arc<Coverage>>,
-    order: VecDeque<CacheEntry>,
-    glyphs: HashMap<GlyphKey, Arc<Glyph>>,
-    bytes: usize,
-    limit: usize,
-}
-
-impl Cache {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: VecDeque::new(),
-            glyphs: HashMap::new(),
-            bytes: 0,
-            limit: CACHE_BYTES,
-        }
-    }
-
-    fn insert(&mut self, key: CacheKey, coverage: Arc<Coverage>) {
-        let bytes = coverage.bytes();
-        if bytes > self.limit || self.entries.contains_key(&key) {
-            return;
-        }
-        while self.bytes + bytes > self.limit {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.evict(oldest);
-        }
-        self.bytes += bytes;
-        self.order.push_back(CacheEntry::Cell(key));
-        self.entries.insert(key, coverage);
-    }
-
-    fn evict(&mut self, entry: CacheEntry) {
-        match entry {
-            CacheEntry::Cell(key) => {
-                if let Some(old) = self.entries.remove(&key) {
-                    self.bytes -= old.bytes();
-                }
-            }
-            CacheEntry::Glyph(key) => {
-                if let Some(old) = self.glyphs.remove(&key) {
-                    self.bytes -= old.bytes(&key);
-                }
-            }
-        }
-    }
-
-    fn insert_glyph(&mut self, key: GlyphKey, glyph: Arc<Glyph>) {
-        let bytes = glyph.bytes(&key);
-        if bytes > self.limit || self.glyphs.contains_key(&key) {
-            return;
-        }
-        while self.bytes + bytes > self.limit {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.evict(oldest);
-        }
-        self.bytes += bytes;
-        self.order.push_back(CacheEntry::Glyph(key.clone()));
-        self.glyphs.insert(key, glyph);
-    }
-}
-
-pub(super) struct Tile {
-    pub rect: Rect,
-    pub image: egui::ColorImage,
-    pub shape_count: usize,
-    pub complete: bool,
-    pub preview: bool,
-    pub first: bool,
-}
-
-pub(super) struct Worker {
-    cancel: Arc<AtomicBool>,
-    receiver: Option<mpsc::Receiver<Result<Tile, ViewError>>>,
-    handles: Vec<(Arc<AtomicBool>, JoinHandle<()>)>,
-    cache: Arc<Mutex<Cache>>,
-}
-
-impl Worker {
-    pub(super) fn new() -> Self {
-        Self {
-            cancel: Arc::new(AtomicBool::new(false)),
-            receiver: None,
-            handles: Vec::new(),
-            cache: Arc::new(Mutex::new(Cache::new())),
-        }
-    }
-
-    pub(super) fn start(
-        &mut self,
-        scene: Arc<Scene>,
-        key: FrameKey,
-        context: egui::Context,
-    ) -> Result<(), ViewError> {
-        self.cancel.store(true, Ordering::Relaxed);
-        self.receiver = None;
-        self.cancel = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = mpsc::sync_channel(2);
-        self.receiver = Some(receiver);
-        let cancel = self.cancel.clone();
-        let cache = self.cache.clone();
-        let job_cancel = cancel.clone();
-        let handle = thread::Builder::new()
-            .name("gds-raster".into())
-            .spawn(move || {
-                if let Err(error) = render_tiles(scene, key, &cancel, cache, &sender, &context)
-                    && !cancel.load(Ordering::Relaxed)
-                    && sender.send(Err(error)).is_err()
-                {
-                    eprintln!("Raster error receiver disconnected");
-                }
-            })
-            .map_err(|error| ViewError(format!("Starting raster worker: {error}")))?;
-        self.handles.push((job_cancel, handle));
-        Ok(())
-    }
-
-    pub(super) fn receive(&mut self) -> Vec<Result<Tile, ViewError>> {
-        let mut messages = Vec::new();
-        if let Some(receiver) = &self.receiver {
-            while let Ok(message) = receiver.try_recv() {
-                messages.push(message);
-            }
-        }
-        let mut index = 0;
-        while index < self.handles.len() {
-            if self.handles[index].1.is_finished() {
-                let (cancel, handle) = self.handles.swap_remove(index);
-                if handle.join().is_err() && !cancel.load(Ordering::Relaxed) {
-                    messages.push(Err(ViewError("Raster worker stopped unexpectedly".into())));
-                }
-            } else {
-                index += 1;
-            }
-        }
-        messages
-    }
-}
-
-impl Drop for Worker {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        self.receiver = None;
-        for (_, handle) in self.handles.drain(..) {
-            if handle.is_finished() && handle.join().is_err() {
-                eprintln!("Raster worker stopped unexpectedly");
-            }
-        }
-    }
-}
-
 pub(super) fn capture(
     scene: Arc<Scene>,
     key: FrameKey,
     context: egui::Context,
 ) -> Result<RenderedImage, ViewError> {
-    let cancel = AtomicBool::new(false);
-    let cache = Arc::new(Mutex::new(Cache::new()));
+    if !key.viewport.min.is_finite()
+        || !key.viewport.max.is_finite()
+        || !key.viewport.width().is_finite()
+        || !key.viewport.height().is_finite()
+        || !key.pixels_per_point.is_finite()
+        || key.viewport.width() <= 0.0
+        || key.viewport.height() <= 0.0
+        || key.pixels_per_point <= 0.0
+    {
+        return Err(ViewError("Invalid reference viewport".into()));
+    }
+    if !key.camera.center.finite()
+        || !key.camera.pixels_per_unit.is_finite()
+        || key.camera.pixels_per_unit <= 0.0
+    {
+        return Err(ViewError("Invalid reference camera".into()));
+    }
     let size = [
         (key.viewport.width() * key.pixels_per_point)
             .ceil()
@@ -464,33 +48,11 @@ pub(super) fn capture(
     ];
     if size[0]
         .checked_mul(size[1])
-        .is_none_or(|pixels| pixels > CACHE_BYTES / 8)
+        .is_none_or(|pixels| pixels > REFERENCE_MEMORY_LIMIT / 8)
     {
         return Err(ViewError("Viewport exceeds rendering memory budget".into()));
     }
-    render_target(
-        scene,
-        key.clone(),
-        f64::from(key.pixels_per_point),
-        [0.0, 0.0],
-        size,
-        &cancel,
-        cache,
-        context,
-    )
-}
 
-#[allow(clippy::too_many_arguments)]
-fn render_target(
-    scene: Arc<Scene>,
-    key: FrameKey,
-    scale: f64,
-    origin: [f64; 2],
-    size: [usize; 2],
-    cancel: &AtomicBool,
-    cache: Arc<Mutex<Cache>>,
-    context: egui::Context,
-) -> Result<RenderedImage, ViewError> {
     let layers: Vec<_> = key
         .styles
         .iter()
@@ -500,25 +62,13 @@ fn render_target(
     let mut image = egui::ColorImage::new(size, vec![Color32::TRANSPARENT; size[0] * size[1]]);
     let mut shape_count = 0_usize;
     for group in layers.chunks(group_size) {
-        if cancel.load(Ordering::Relaxed) {
-            break;
-        }
         let mut request = key.clone();
         for (layer, style) in &mut request.styles {
             style.visible = group.binary_search(layer).is_ok();
         }
-        let mut painter = Rasterizer::new(
-            scene.clone(),
-            request,
-            scale,
-            origin,
-            size,
-            cancel,
-            cache.clone(),
-            context.clone(),
-        );
+        let mut painter = Rasterizer::new(scene.clone(), request, size, context.clone());
         if let Some(selected) = key.selected {
-            painter.paint(selected, Transformation::default(), 0, true)?;
+            painter.paint(selected)?;
         }
         shape_count = shape_count.saturating_add(painter.count);
         for (destination, source) in image.pixels.iter_mut().zip(painter.image().pixels) {
@@ -535,91 +85,12 @@ fn render_target(
                 Color32::from_rgba_premultiplied(blended[0], blended[1], blended[2], blended[3]);
         }
     }
-    let cache_bytes = cache
-        .lock()
-        .map_err(|error| ViewError(error.to_string()))?
-        .bytes;
     Ok(RenderedImage {
         image,
         shape_count,
-        cache_bytes,
+        cache_bytes: 0,
+        statistics: RenderStatus::default(),
     })
-}
-
-fn render_tiles(
-    scene: Arc<Scene>,
-    key: FrameKey,
-    cancel: &AtomicBool,
-    cache: Arc<Mutex<Cache>>,
-    sender: &mpsc::SyncSender<Result<Tile, ViewError>>,
-    context: &egui::Context,
-) -> Result<(), ViewError> {
-    let width = (key.viewport.width() * key.pixels_per_point)
-        .ceil()
-        .max(1.0) as usize;
-    let height = (key.viewport.height() * key.pixels_per_point)
-        .ceil()
-        .max(1.0) as usize;
-    if width
-        .checked_mul(height)
-        .is_none_or(|pixels| pixels > CACHE_BYTES / 8)
-    {
-        return Err(ViewError("Viewport exceeds rendering memory budget".into()));
-    }
-    for preview in [true, false] {
-        let scale = f64::from(key.pixels_per_point) / if preview { 4.0 } else { 1.0 };
-        let width = if preview { width.div_ceil(4) } else { width };
-        let height = if preview { height.div_ceil(4) } else { height };
-        let tile_size = if preview {
-            width.max(height)
-        } else {
-            TILE_SIZE
-        };
-        for top in (0..height).step_by(tile_size) {
-            for left in (0..width).step_by(tile_size) {
-                if cancel.load(Ordering::Relaxed) {
-                    return Ok(());
-                }
-                let tile_width = tile_size.min(width - left);
-                let tile_height = tile_size.min(height - top);
-                let rendered = render_target(
-                    scene.clone(),
-                    key.clone(),
-                    scale,
-                    [left as f64, top as f64],
-                    [tile_width, tile_height],
-                    cancel,
-                    cache.clone(),
-                    context.clone(),
-                )?;
-                let image = rendered.image;
-                let rect = Rect::from_min_max(
-                    key.viewport.min
-                        + Vec2::new((left as f64 / scale) as f32, (top as f64 / scale) as f32),
-                    key.viewport.min
-                        + Vec2::new(
-                            ((left + tile_width) as f64 / scale) as f32,
-                            ((top + tile_height) as f64 / scale) as f32,
-                        ),
-                )
-                .intersect(key.viewport);
-                let complete =
-                    !preview && left + tile_width == width && top + tile_height == height;
-                let tile = Tile {
-                    rect,
-                    image,
-                    shape_count: rendered.shape_count,
-                    complete,
-                    preview,
-                    first: left == 0 && top == 0,
-                };
-                if cancel.load(Ordering::Relaxed) || sender.send(Ok(tile)).is_err() {
-                    return Ok(());
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 struct Cursor {
@@ -633,11 +104,6 @@ struct Cursor {
 
 struct ArrayCursor {
     multiplier: usize,
-    pixel_origin: DoublePoint,
-    pixel_column: DoublePoint,
-    pixel_row: DoublePoint,
-    aggregate: bool,
-    row_jump: u16,
     cell: CellId,
     base: Transformation,
     depth: u16,
@@ -655,46 +121,26 @@ enum Work {
     Array(ArrayCursor),
 }
 
-struct Rasterizer<'a> {
+struct Rasterizer {
     scene: Arc<Scene>,
     key: FrameKey,
     scale: f64,
-    origin: [f64; 2],
     size: [usize; 2],
     masks: BTreeMap<LayerKey, Vec<u8>>,
     context: egui::Context,
     count: usize,
-    cancel: &'a AtomicBool,
-    cache: Arc<Mutex<Cache>>,
-    seen: HashSet<(CacheKey, i64, i64)>,
-    cache_depth: usize,
 }
 
-impl<'a> Rasterizer<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        scene: Arc<Scene>,
-        key: FrameKey,
-        scale: f64,
-        origin: [f64; 2],
-        size: [usize; 2],
-        cancel: &'a AtomicBool,
-        cache: Arc<Mutex<Cache>>,
-        context: egui::Context,
-    ) -> Self {
+impl Rasterizer {
+    fn new(scene: Arc<Scene>, key: FrameKey, size: [usize; 2], context: egui::Context) -> Self {
         Self {
             scene,
+            scale: f64::from(key.pixels_per_point),
             key,
-            scale,
-            origin,
             size,
             masks: BTreeMap::new(),
             context,
             count: 0,
-            cancel,
-            cache,
-            seen: HashSet::new(),
-            cache_depth: 0,
         }
     }
 
@@ -703,56 +149,43 @@ impl<'a> Rasterizer<'a> {
             .minus(self.key.camera.center)
             .times(self.key.camera.pixels_per_unit * self.scale);
         DoublePoint::new(
-            f64::from(self.key.viewport.width()) * self.scale * 0.5 + displacement.x
-                - self.origin[0],
-            f64::from(self.key.viewport.height()) * self.scale * 0.5
-                - displacement.y
-                - self.origin[1],
+            f64::from(self.key.viewport.width()) * self.scale * 0.5 + displacement.x,
+            f64::from(self.key.viewport.height()) * self.scale * 0.5 - displacement.y,
         )
     }
 
     fn visible(&self) -> Bounds {
-        let minimum = self.key.viewport.min
-            + Vec2::new(
-                (self.origin[0] / self.scale) as f32,
-                ((self.origin[1] + self.size[1] as f64) / self.scale) as f32,
-            );
-        let maximum = self.key.viewport.min
-            + Vec2::new(
-                ((self.origin[0] + self.size[0] as f64) / self.scale) as f32,
-                (self.origin[1] / self.scale) as f32,
-            );
+        let minimum =
+            self.key.viewport.min + Vec2::new(0.0, (self.size[1] as f64 / self.scale) as f32);
+        let maximum =
+            self.key.viewport.min + Vec2::new((self.size[0] as f64 / self.scale) as f32, 0.0);
         Bounds {
             minimum: self.key.camera.screen_to_world(minimum, self.key.viewport),
             maximum: self.key.camera.screen_to_world(maximum, self.key.viewport),
         }
     }
 
-    fn paint(
-        &mut self,
-        cell: CellId,
-        transformation: Transformation,
-        depth: u16,
-        use_cache: bool,
-    ) -> Result<(), ViewError> {
-        let root_depth = depth;
-        let mut stack = vec![Work::Cell(cell, transformation, depth, 1)];
+    fn paint(&mut self, cell: CellId) -> Result<(), ViewError> {
+        let mut stack = vec![Work::Cell(cell, Transformation::default(), 0, 1)];
         let visible = self.visible();
         while let Some(work) = stack.pop() {
-            if self.cancel.load(Ordering::Relaxed) {
-                return Ok(());
-            }
             match work {
                 Work::Cell(cell, transformation, depth, multiplier) => {
                     if !transformation.valid() {
                         return Err(ViewError("Hierarchy transformation overflow".into()));
                     }
+                    let metrics = self
+                        .scene
+                        .label_metrics
+                        .get(cell.index())
+                        .copied()
+                        .ok_or_else(|| ViewError("Missing reference cell label metrics".into()))?;
                     let culling = visible.expanded(label_margin(
-                        self.scene.label_metrics[cell.index()],
+                        metrics,
                         transformation.magnification,
                         1.0 / self.key.camera.pixels_per_unit,
                     ));
-                    let Some(bounds) = self
+                    let Some(_) = self
                         .scene
                         .layout
                         .transformed_bounds(cell, transformation)
@@ -760,16 +193,6 @@ impl<'a> Rasterizer<'a> {
                     else {
                         continue;
                     };
-                    let previous = self.count;
-                    if self.cache_depth < 32
-                        && (use_cache || depth > root_depth)
-                        && self.cached(cell, transformation, depth, bounds)?
-                    {
-                        self.count = self.count.saturating_add(
-                            (self.count - previous).saturating_mul(multiplier.saturating_sub(1)),
-                        );
-                        continue;
-                    }
                     let Some(index) = self.scene.indexes.get(&cell) else {
                         return Err(ViewError("Missing spatial index".into()));
                     };
@@ -822,7 +245,15 @@ impl<'a> Rasterizer<'a> {
                             let (mut columns, mut rows) = visible_array_range(
                                 bounds,
                                 visible.expanded(label_margin(
-                                    scene.label_metrics[instance.cell.index()],
+                                    scene
+                                        .label_metrics
+                                        .get(instance.cell.index())
+                                        .copied()
+                                        .ok_or_else(|| {
+                                            ViewError(
+                                                "Missing reference child label metrics".into(),
+                                            )
+                                        })?,
                                     base.magnification,
                                     1.0 / self.key.camera.pixels_per_unit,
                                 )),
@@ -831,36 +262,19 @@ impl<'a> Rasterizer<'a> {
                                 instance.array.columns,
                                 instance.array.rows,
                             );
+                            let mut multiplier = cursor.multiplier;
                             if column_step == DoublePoint::default() && columns.0 < columns.1 {
+                                multiplier =
+                                    multiplier.saturating_mul(usize::from(columns.1 - columns.0));
                                 columns.1 = columns.0 + 1;
                             }
                             if row_step == DoublePoint::default() && rows.0 < rows.1 {
+                                multiplier =
+                                    multiplier.saturating_mul(usize::from(rows.1 - rows.0));
                                 rows.1 = rows.0 + 1;
                             }
-                            let scale = self.key.camera.pixels_per_unit * self.scale;
-                            let metrics = scene.label_metrics[instance.cell.index()];
-                            let margin = label_margin(metrics, base.magnification, self.scale);
-                            let width = (bounds.width() * scale + margin * 2.0).ceil() + 2.0;
-                            let height = (bounds.height() * scale + margin * 2.0).ceil() + 2.0;
-                            let limit = if metrics.0 > 0.0 { 256.0 } else { 64.0 };
-                            let pixel_origin = self
-                                .screen(bounds.center())
-                                .minus(DoublePoint::new(width * 0.5, height * 0.5));
                             let array = ArrayCursor {
-                                multiplier: cursor.multiplier,
-                                pixel_origin,
-                                pixel_column: DoublePoint::new(
-                                    column_step.x * scale,
-                                    -column_step.y * scale,
-                                ),
-                                pixel_row: DoublePoint::new(
-                                    row_step.x * scale,
-                                    -row_step.y * scale,
-                                ),
-                                aggregate: self.cache_depth < 32
-                                    && width <= limit
-                                    && height <= limit,
-                                row_jump: 1,
+                                multiplier,
                                 cell: instance.cell,
                                 base,
                                 depth: cursor.depth.saturating_add(1),
@@ -880,23 +294,18 @@ impl<'a> Rasterizer<'a> {
                             .shapes()
                             .get(entry.index)
                             .ok_or_else(|| ViewError("Missing indexed shape".into()))?;
-                        if let Some(style) = self
+                        if self
                             .key
                             .styles
                             .get(&shape.layer)
                             .copied()
-                            .filter(|style| style.visible)
+                            .is_some_and(|style| style.visible)
                         {
                             let previous = self.count;
-                            self.shape(
-                                &shape.geometry,
-                                shape.layer,
-                                style.color,
-                                cursor.transformation,
-                            )
-                            .map_err(|error| {
-                                shape_error(cell.name(), shape.layer, entry.index, error)
-                            })?;
+                            self.shape(&shape.geometry, shape.layer, cursor.transformation)
+                                .map_err(|error| {
+                                    shape_error(cell.name(), shape.layer, entry.index, error)
+                                })?;
                             self.count = self.count.saturating_add(
                                 (self.count - previous)
                                     .saturating_mul(cursor.multiplier.saturating_sub(1)),
@@ -908,30 +317,6 @@ impl<'a> Rasterizer<'a> {
                 Work::Array(mut array) => {
                     if array.row >= array.rows.1 || array.columns.0 == array.columns.1 {
                         continue;
-                    }
-                    let position = array
-                        .pixel_origin
-                        .plus(array.pixel_column.times(f64::from(array.column)))
-                        .plus(array.pixel_row.times(f64::from(array.row)));
-                    let column_jump = if array.aggregate {
-                        pixel_run(position, array.pixel_column)
-                            .min(usize::from(array.columns.1 - array.column))
-                            .max(1) as u16
-                    } else {
-                        1
-                    };
-                    if array.column == array.columns.0 {
-                        let orthogonal = (array.pixel_column.y == 0.0 && array.pixel_row.x == 0.0)
-                            || (array.pixel_column.x == 0.0 && array.pixel_row.y == 0.0);
-                        array.row_jump = if array.aggregate
-                            && (orthogonal || array.columns.1 - array.columns.0 == 1)
-                        {
-                            pixel_run(position, array.pixel_row)
-                                .min(usize::from(array.rows.1 - array.row))
-                                .max(1) as u16
-                        } else {
-                            1
-                        };
                     }
                     let translation = array
                         .base
@@ -945,15 +330,12 @@ impl<'a> Rasterizer<'a> {
                             ..array.base
                         },
                         array.depth,
-                        array
-                            .multiplier
-                            .saturating_mul(usize::from(column_jump))
-                            .saturating_mul(usize::from(array.row_jump)),
+                        array.multiplier,
                     );
-                    array.column += column_jump;
+                    array.column += 1;
                     if array.column >= array.columns.1 {
                         array.column = array.columns.0;
-                        array.row += array.row_jump;
+                        array.row += 1;
                     }
                     stack.push(Work::Array(array));
                     stack.push(child);
@@ -963,134 +345,10 @@ impl<'a> Rasterizer<'a> {
         Ok(())
     }
 
-    fn cached(
-        &mut self,
-        cell: CellId,
-        transformation: Transformation,
-        depth: u16,
-        bounds: Bounds,
-    ) -> Result<bool, ViewError> {
-        let scale = self.key.camera.pixels_per_unit * self.scale;
-        let metrics = self.scene.label_metrics[cell.index()];
-        let margin = if metrics.0 > 0.0 {
-            (metrics.0 + 1.0)
-                * (12.0 * metrics.1 * transformation.magnification).clamp(6.0, 96.0)
-                * self.scale
-        } else {
-            0.0
-        };
-        let width = (bounds.width() * scale + margin * 2.0).ceil() as usize + 2;
-        let height = (bounds.height() * scale + margin * 2.0).ceil() as usize + 2;
-        let limit = if metrics.0 > 0.0 { 256 } else { 64 };
-        if width > limit || height > limit {
-            return Ok(false);
-        }
-        let mut layers = DefaultHasher::new();
-        for (layer, style) in &self.key.styles {
-            if style.visible {
-                layer.hash(&mut layers);
-            }
-        }
-        let key = CacheKey {
-            cell,
-            angle: transformation.angle.to_bits(),
-            magnification: transformation.magnification.to_bits(),
-            reflected: transformation.reflected,
-            scale: scale.to_bits(),
-            font_scale: self.scale.to_bits(),
-            depth: self.key.depth.saturating_sub(depth),
-            layers: layers.finish(),
-        };
-        let existing = self
-            .cache
-            .lock()
-            .map_err(|error| ViewError(error.to_string()))?
-            .entries
-            .get(&key)
-            .cloned();
-        let coverage = if let Some(coverage) = existing {
-            coverage
-        } else {
-            let local = Transformation {
-                translation: DoublePoint::default(),
-                ..transformation
-            };
-            let local_bounds = self
-                .scene
-                .layout
-                .transformed_bounds(cell, local)
-                .ok_or_else(|| ViewError("Missing cached bounds".into()))?;
-            let mut request = self.key.clone();
-            request.camera = Camera {
-                center: local_bounds.center(),
-                pixels_per_unit: self.key.camera.pixels_per_unit,
-            };
-            request.viewport =
-                Rect::from_min_size(Pos2::ZERO, Vec2::new(width as f32, height as f32));
-            request.depth = key.depth;
-            let mut painter = Self::new(
-                self.scene.clone(),
-                request,
-                self.scale,
-                [0.0, 0.0],
-                [width, height],
-                self.cancel,
-                self.cache.clone(),
-                self.context.clone(),
-            );
-            painter.cache_depth = self.cache_depth + 1;
-            painter.paint(cell, local, 0, false)?;
-            if self.cancel.load(Ordering::Relaxed) {
-                return Ok(true);
-            }
-            let coverage = Arc::new(Coverage::new(width, height, painter.masks, painter.count));
-            self.cache
-                .lock()
-                .map_err(|error| ViewError(error.to_string()))?
-                .insert(key, coverage.clone());
-            coverage
-        };
-        let center = self.screen(bounds.center());
-        let left = (center.x - coverage.width as f64 * 0.5).floor() as i64;
-        let top = (center.y - coverage.height as f64 * 0.5).floor() as i64;
-        if self.seen.len() >= 50_000 {
-            self.seen.clear();
-        }
-        if !self.seen.insert((key, left, top)) {
-            self.count = self.count.saturating_add(coverage.shape_count);
-            return Ok(true);
-        }
-        for (layer, runs) in &coverage.runs {
-            let target = self
-                .masks
-                .entry(*layer)
-                .or_insert_with(|| vec![0; self.size[0] * self.size[1]]);
-            for run in runs {
-                let y = top + run.row as i64;
-                if y < 0 || y >= self.size[1] as i64 {
-                    continue;
-                }
-                let x = left + run.start as i64;
-                let start = (-x).max(0).min(run.pixels.len() as i64) as usize;
-                let end = (self.size[0] as i64 - x)
-                    .max(0)
-                    .min(run.pixels.len() as i64) as usize;
-                for offset in start..end {
-                    let destination =
-                        &mut target[y as usize * self.size[0] + (x + offset as i64) as usize];
-                    *destination = (*destination).max(run.pixels[offset]);
-                }
-            }
-        }
-        self.count = self.count.saturating_add(coverage.shape_count);
-        Ok(true)
-    }
-
     fn shape(
         &mut self,
         geometry: &Geometry,
         layer: LayerKey,
-        _color: Color32,
         transformation: Transformation,
     ) -> Result<(), ViewError> {
         if let Geometry::Label(label) = geometry {
@@ -1151,28 +409,12 @@ impl<'a> Rasterizer<'a> {
     ) -> Result<(), ViewError> {
         let transformation = parent.compose(label.transformation);
         let size = (12.0 * transformation.magnification).clamp(6.0, 96.0);
-        let key = GlyphKey {
+        let request = GlyphRequest {
             text: label.text.clone(),
             size: size.to_bits(),
             pixels_per_point: self.key.pixels_per_point.to_bits(),
         };
-        let existing = self
-            .cache
-            .lock()
-            .map_err(|error| ViewError(error.to_string()))?
-            .glyphs
-            .get(&key)
-            .cloned();
-        let glyph = if let Some(glyph) = existing {
-            glyph
-        } else {
-            let glyph = Arc::new(make_glyph(&self.context, &key)?);
-            self.cache
-                .lock()
-                .map_err(|error| ViewError(error.to_string()))?
-                .insert_glyph(key, glyph.clone());
-            glyph
-        };
+        let glyph = make_glyph(&self.context, &request)?;
         let origin = self.screen(transformation.translation);
         let anchor = DoublePoint::new(
             f64::from(glyph.logical_size.x) * f64::from(label.horizontal_alignment) * 0.5,
@@ -1260,23 +502,23 @@ impl<'a> Rasterizer<'a> {
     }
 }
 
-fn make_glyph(context: &egui::Context, key: &GlyphKey) -> Result<Glyph, ViewError> {
+fn make_glyph(context: &egui::Context, request: &GlyphRequest) -> Result<Glyph, ViewError> {
     let (galley, atlas) = context.fonts_mut(|fonts| {
         let galley = fonts.layout_no_wrap(
-            key.text.clone(),
-            egui::FontId::proportional(f64::from_bits(key.size) as f32),
+            request.text.clone(),
+            egui::FontId::proportional(f64::from_bits(request.size) as f32),
             Color32::WHITE,
         );
         (galley, fonts.image())
     });
-    let pixels_per_point = f64::from(f32::from_bits(key.pixels_per_point));
+    let pixels_per_point = f64::from(f32::from_bits(request.pixels_per_point));
     let size = [
         (f64::from(galley.size().x) * pixels_per_point).ceil() as usize,
         (f64::from(galley.size().y) * pixels_per_point).ceil() as usize,
     ];
     let length = size[0]
         .checked_mul(size[1])
-        .filter(|length| *length <= CACHE_BYTES)
+        .filter(|length| *length <= REFERENCE_MEMORY_LIMIT)
         .ok_or_else(|| ViewError("Text exceeds rendering memory budget".into()))?;
     let mut alpha = vec![0_u8; length];
     for row in &galley.rows {
@@ -1343,21 +585,6 @@ fn make_glyph(context: &egui::Context, key: &GlyphKey) -> Result<Glyph, ViewErro
         pixels_per_point,
         alpha,
     })
-}
-
-fn pixel_run(position: DoublePoint, step: DoublePoint) -> usize {
-    let mut count = usize::MAX;
-    for (position, step) in [(position.x, step.x), (position.y, step.y)] {
-        let steps = if step > 0.0 {
-            ((position.floor() + 1.0 - position) / step).ceil().max(1.0) as usize
-        } else if step < 0.0 {
-            (((position - position.floor()) / -step).floor().max(0.0) as usize).saturating_add(1)
-        } else {
-            usize::MAX
-        };
-        count = count.min(steps);
-    }
-    count.max(1)
 }
 
 fn label_margin(metrics: (f64, f64), magnification: f64, units_per_point: f64) -> f64 {
@@ -1658,123 +885,8 @@ mod tests {
     }
 
     #[test]
-    fn cache_eviction_preserves_the_memory_limit() {
-        let mut cache = Cache::new();
-        let coverage = Arc::new(Coverage::new(
-            8,
-            8,
-            BTreeMap::from([(
-                LayerKey {
-                    layer: 1,
-                    datatype: 0,
-                },
-                vec![255; 64],
-            )]),
-            1,
-        ));
-        cache.limit = coverage.bytes();
-        let key = CacheKey {
-            cell: CellId::from_index(0),
-            angle: 0,
-            magnification: 0,
-            scale: 0,
-            font_scale: 0,
-            reflected: false,
-            depth: 0,
-            layers: 0,
-        };
-        cache.insert(key, coverage.clone());
-        let other = CacheKey {
-            cell: CellId::from_index(1),
-            ..key
-        };
-        cache.insert(other, coverage);
-        assert_eq!(cache.entries.len(), 1);
-        assert!(!cache.entries.contains_key(&key));
-        assert!(cache.bytes <= cache.limit);
-    }
-
-    #[test]
-    fn raster_worker_tiles_complete_and_cancel_obsolete_views() -> Result<(), Box<dyn Error>> {
-        let scene = scene(
-            vec![square(1)],
-            vec![Instance {
-                cell: CellId::from_index(0),
-                transformation: Transformation::default(),
-                array: Array {
-                    columns: 200,
-                    rows: 200,
-                    column_step: DoublePoint::new(10.0, 0.0),
-                    row_step: DoublePoint::new(0.0, 10.0),
-                },
-            }],
-        )?;
-        let context = context();
-        let mut key = request(&scene, Vec2::new(520.0, 280.0));
-        let expected = capture(scene.clone(), key.clone(), context.clone())?.image;
-        let mut worker = Worker::new();
-        worker.start(scene.clone(), key.clone(), context.clone())?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut pixels = vec![Color32::TRANSPARENT; 520 * 280];
-        let mut complete = false;
-        let mut preview = false;
-        while !complete && std::time::Instant::now() < deadline {
-            for tile in worker.receive() {
-                let tile = tile?;
-                if tile.preview {
-                    preview = true;
-                    continue;
-                }
-                let left = (tile.rect.left() - key.viewport.left()).round() as usize;
-                let top = (tile.rect.top() - key.viewport.top()).round() as usize;
-                for row in 0..tile.image.size[1] {
-                    for column in 0..tile.image.size[0] {
-                        pixels[(top + row) * 520 + left + column] =
-                            tile.image.pixels[row * tile.image.size[0] + column];
-                    }
-                }
-                complete = tile.complete;
-            }
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(preview && complete);
-        assert_eq!(pixels, expected.pixels);
-        worker.start(scene.clone(), key.clone(), context.clone())?;
-        for style in key.styles.values_mut() {
-            style.visible = false;
-        }
-        worker.start(scene.clone(), key, context.clone())?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut complete = false;
-        while !complete && std::time::Instant::now() < deadline {
-            for tile in worker.receive() {
-                let tile = tile?;
-                assert!(
-                    tile.image
-                        .pixels
-                        .iter()
-                        .all(|pixel| *pixel == Color32::TRANSPARENT)
-                );
-                complete |= tile.complete;
-            }
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(complete);
-        let mut invalid = request(&scene, Vec2::splat(20_000.0));
-        invalid.selected = None;
-        worker.start(scene, invalid, context)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut failure = None;
-        while failure.is_none() && std::time::Instant::now() < deadline {
-            failure = worker.receive().into_iter().find_map(Result::err);
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(failure.is_some_and(|error| error.to_string().contains("memory budget")));
-        Ok(())
-    }
-
-    #[test]
-    fn render_visits_more_than_the_old_limit_and_keeps_thin_shapes() -> Result<(), Box<dyn Error>> {
+    fn uncached_reference_visits_all_placements_and_keeps_thin_shapes() -> Result<(), Box<dyn Error>>
+    {
         let shape = Shape {
             layer: LayerKey {
                 layer: 1,
@@ -1809,26 +921,74 @@ mod tests {
     }
 
     #[test]
-    fn billion_instance_arrays_aggregate_at_screen_resolution() -> Result<(), Box<dyn Error>> {
-        let scene = scene(
-            vec![square(1)],
-            vec![Instance {
-                cell: CellId::from_index(0),
-                transformation: Transformation::default(),
-                array: Array {
-                    columns: u16::MAX,
-                    rows: u16::MAX,
-                    column_step: DoublePoint::new(0.0001, 0.0),
-                    row_step: DoublePoint::new(0.0, 0.0001),
+    fn fractional_arrays_and_coincident_counts_keep_layer_union() -> Result<(), Box<dyn Error>> {
+        let color = Color32::from_rgba_unmultiplied(200, 100, 50, 128);
+        for (array, count, right) in [
+            (
+                Array {
+                    columns: 3,
+                    rows: 1,
+                    column_step: DoublePoint::new(0.4, 0.0),
+                    row_step: DoublePoint::default(),
                 },
-            }],
-        )?;
-        let image = capture(scene.clone(), request(&scene, Vec2::splat(40.0)), context())?;
-        assert_eq!(
-            image.shape_count,
-            usize::from(u16::MAX) * usize::from(u16::MAX)
-        );
-        assert!(image.image.pixels.iter().any(|pixel| pixel.a() != 0));
+                3,
+                10,
+            ),
+            (
+                Array {
+                    columns: 7,
+                    rows: 11,
+                    column_step: DoublePoint::default(),
+                    row_step: DoublePoint::default(),
+                },
+                77,
+                9,
+            ),
+        ] {
+            let scene = scene(
+                vec![Shape {
+                    layer: LayerKey {
+                        layer: 1,
+                        datatype: 0,
+                    },
+                    geometry: Geometry::Box {
+                        minimum: Point::new(0, 0),
+                        maximum: Point::new(1, 4),
+                    },
+                }],
+                vec![Instance {
+                    cell: CellId::from_index(0),
+                    transformation: Transformation::default(),
+                    array,
+                }],
+            )?;
+            let mut key = request(&scene, Vec2::splat(16.0));
+            for style in key.styles.values_mut() {
+                style.color = color;
+            }
+            let rendered = capture(scene, key, context())?;
+            assert_eq!(rendered.shape_count, count);
+            assert_eq!(rendered.cache_bytes, 0);
+            for (index, pixel) in rendered.image.pixels.iter().enumerate() {
+                let x = index % 16;
+                let y = index / 16;
+                let expected = if (8..right).contains(&x) && (4..8).contains(&y) {
+                    color
+                } else {
+                    Color32::TRANSPARENT
+                };
+                assert_eq!(*pixel, expected, "Unexpected array pixel at ({x}, {y})");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uncached_reference_rejects_invalid_viewports() -> Result<(), Box<dyn Error>> {
+        let scene = scene(vec![square(1)], vec![])?;
+        for size in [Vec2::splat(20_000.0), Vec2::ZERO] {
+            assert!(capture(scene.clone(), request(&scene, size), context()).is_err());
+        }
         Ok(())
     }
 
