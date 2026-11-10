@@ -2,15 +2,18 @@ use super::prepare::{ArrayInstances, GpuVertex, MeshData, Packet, TileInfo};
 use super::*;
 use egui_wgpu::{Callback, CallbackResources, CallbackTrait, RenderState, ScreenDescriptor, wgpu};
 use std::collections::{BTreeMap, HashSet, VecDeque};
+#[cfg(not(target_arch = "wasm32"))]
 use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
 use std::pin::Pin;
 use std::sync::{
     Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 
 const GPU_LIMIT: usize = 256 * 1024 * 1024;
@@ -450,6 +453,7 @@ impl SessionState {
 pub struct GpuRendererHandle {
     engine: Arc<Mutex<Engine>>,
     device: wgpu::Device,
+    #[cfg(not(target_arch = "wasm32"))]
     queue: wgpu::Queue,
     adapter: wgpu::AdapterInfo,
     format: wgpu::TextureFormat,
@@ -458,13 +462,18 @@ pub struct GpuRendererHandle {
     device_error: Arc<Mutex<Option<String>>>,
 }
 impl GpuRendererHandle {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn from_render_state(state: &RenderState) -> Result<Self, ViewError> {
+        pollster::block_on(Self::from_render_state_async(state))
+    }
+    pub async fn from_render_state_async(state: &RenderState) -> Result<Self, ViewError> {
         let handle = Self::create(
             state.device.clone(),
             state.queue.clone(),
             state.adapter.get_info(),
             state.target_format,
-        )?;
+        )
+        .await?;
         state
             .renderer
             .write()
@@ -472,6 +481,7 @@ impl GpuRendererHandle {
             .insert(handle.clone());
         Ok(handle)
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn headless() -> Result<Self, ViewError> {
         if wgpu::Instance::enabled_backend_features().is_empty() {
             return Err(ViewError("No native WGPU backend is enabled".into()));
@@ -503,8 +513,9 @@ impl GpuRendererHandle {
             adapter.get_info(),
             wgpu::TextureFormat::Rgba8Unorm,
         )
+        .await
     }
-    fn create(
+    async fn create(
         device: wgpu::Device,
         queue: wgpu::Queue,
         adapter: wgpu::AdapterInfo,
@@ -542,13 +553,15 @@ impl GpuRendererHandle {
             format,
             ledger.clone(),
             in_flight.clone(),
-        )?;
-        if let Some(error) = pollster::block_on(validation.pop()) {
+        );
+        if let Some(error) = validation.pop().await {
             return Err(ViewError(format!("Creating GPU pipelines: {error}")));
         }
+        let engine = engine?;
         Ok(Self {
             engine: Arc::new(Mutex::new(engine)),
             device,
+            #[cfg(not(target_arch = "wasm32"))]
             queue,
             adapter,
             format,
@@ -664,6 +677,7 @@ impl RenderSession {
             .fetch_add(IN_FLIGHT_LIMIT, Ordering::Relaxed);
         TestQueueSaturation(self.handle.in_flight.clone())
     }
+    #[cfg(not(target_arch = "wasm32"))]
     pub(super) async fn capture(
         &self,
         key: FrameKey,
@@ -755,11 +769,14 @@ impl Drop for TestQueueSaturation {
         self.0.fetch_sub(IN_FLIGHT_LIMIT, Ordering::Relaxed);
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct CaptureState {
     result: Option<Result<RenderedImage, ViewError>>,
     waker: Option<Waker>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 struct CaptureFuture(Arc<Mutex<CaptureState>>);
+#[cfg(not(target_arch = "wasm32"))]
 impl Future for CaptureFuture {
     type Output = Result<RenderedImage, ViewError>;
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
@@ -2399,6 +2416,7 @@ impl CallbackTrait for CanvasCallback {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn capture(
     handle: &GpuRendererHandle,
     scene: Arc<Scene>,
@@ -2427,6 +2445,7 @@ fn capture(
     }
     result
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn capture_requested(
     handle: &GpuRendererHandle,
     scene: Arc<Scene>,

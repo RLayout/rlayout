@@ -1,11 +1,19 @@
 use super::*;
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::hash::{BuildHasherDefault, Hasher};
+use std::pin::Pin;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::Condvar;
 use std::sync::{
-    Condvar, Mutex,
+    Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     mpsc,
 };
+#[cfg(any(target_arch = "wasm32", test))]
+use std::task::Waker;
+use std::task::{Context, Poll};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 
 const TILE_SIZE: usize = 256;
@@ -180,7 +188,10 @@ struct Mailbox {
 
 struct Shared {
     mailbox: Mutex<Mailbox>,
+    #[cfg(not(target_arch = "wasm32"))]
     wake: Condvar,
+    cooperative: bool,
+    budget: Mutex<PreparationBudget>,
     generation: AtomicU64,
     stopped: AtomicBool,
     active: AtomicBool,
@@ -190,6 +201,41 @@ struct Shared {
     blocked_nanos: AtomicU64,
     #[cfg(test)]
     complete_leaf_cells: AtomicUsize,
+}
+
+#[derive(Default)]
+struct PreparationBudget {
+    deadline: Option<Instant>,
+    remaining: usize,
+}
+
+impl Shared {
+    fn new(cooperative: bool) -> Arc<Self> {
+        Arc::new(Self {
+            mailbox: Mutex::new(Mailbox {
+                pending: None,
+                stopped: false,
+            }),
+            #[cfg(not(target_arch = "wasm32"))]
+            wake: Condvar::new(),
+            cooperative,
+            budget: Mutex::new(PreparationBudget::default()),
+            generation: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+            active: AtomicBool::new(false),
+            cache_bytes: AtomicUsize::new(0),
+            packet_bytes: Arc::new(AtomicUsize::new(0)),
+            preparation_nanos: AtomicU64::new(0),
+            blocked_nanos: AtomicU64::new(0),
+            #[cfg(test)]
+            complete_leaf_cells: AtomicUsize::new(0),
+        })
+    }
+
+    fn notify(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        self.wake.notify_one();
+    }
 }
 
 struct Delivery {
@@ -208,28 +254,21 @@ impl Drop for Delivery {
 pub(super) struct Worker {
     shared: Arc<Shared>,
     receiver: mpsc::Receiver<Delivery>,
+    #[cfg(not(target_arch = "wasm32"))]
     handle: Option<JoinHandle<()>>,
+    #[cfg(target_arch = "wasm32")]
+    producer: Producer,
+    #[cfg(target_arch = "wasm32")]
+    context: Option<egui::Context>,
+    #[cfg(target_arch = "wasm32")]
+    budget_frame: Option<u64>,
 }
 
 impl Worker {
     pub(super) fn new() -> Result<Self, ViewError> {
-        let shared = Arc::new(Shared {
-            mailbox: Mutex::new(Mailbox {
-                pending: None,
-                stopped: false,
-            }),
-            wake: Condvar::new(),
-            generation: AtomicU64::new(0),
-            stopped: AtomicBool::new(false),
-            active: AtomicBool::new(false),
-            cache_bytes: AtomicUsize::new(0),
-            packet_bytes: Arc::new(AtomicUsize::new(0)),
-            preparation_nanos: AtomicU64::new(0),
-            blocked_nanos: AtomicU64::new(0),
-            #[cfg(test)]
-            complete_leaf_cells: AtomicUsize::new(0),
-        });
+        let shared = Shared::new(cfg!(target_arch = "wasm32"));
         let (sender, receiver) = mpsc::sync_channel(2);
+        #[cfg(not(target_arch = "wasm32"))]
         let handle = thread::Builder::new()
             .name("gds-geometry".into())
             .spawn({
@@ -238,9 +277,16 @@ impl Worker {
             })
             .map_err(|error| ViewError(format!("Starting geometry worker: {error}")))?;
         Ok(Self {
-            shared,
+            shared: shared.clone(),
             receiver,
+            #[cfg(not(target_arch = "wasm32"))]
             handle: Some(handle),
+            #[cfg(target_arch = "wasm32")]
+            producer: Producer::new(shared.clone(), sender),
+            #[cfg(target_arch = "wasm32")]
+            context: None,
+            #[cfg(target_arch = "wasm32")]
+            budget_frame: None,
         })
     }
 
@@ -267,6 +313,10 @@ impl Worker {
         if mailbox.stopped {
             return Err(ViewError("Geometry worker has stopped".into()));
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.context = Some(context.clone());
+        }
         mailbox.pending = Some(Job {
             generation,
             scene,
@@ -274,7 +324,7 @@ impl Worker {
             context,
             preview,
         });
-        self.shared.wake.notify_one();
+        self.shared.notify();
         Ok(generation)
     }
 
@@ -297,12 +347,38 @@ impl Worker {
             }
             Err(error) => eprintln!("Cancelling geometry request: {error}"),
         }
-        self.shared.wake.notify_one();
+        self.shared.notify();
     }
 
     pub(super) fn receive(&mut self) -> Vec<Result<Packet, ViewError>> {
-        let generation = self.shared.generation.load(Ordering::Acquire);
         let mut results = Vec::new();
+        #[cfg(target_arch = "wasm32")]
+        {
+            let frame = self
+                .context
+                .as_ref()
+                .map(egui::Context::cumulative_frame_nr);
+            if frame != self.budget_frame || self.budget_frame.is_none() {
+                self.budget_frame = frame;
+                if let Err(error) = self
+                    .producer
+                    .set_budget(Duration::from_millis(3), usize::MAX)
+                {
+                    results.push(Err(error));
+                    return results;
+                }
+            }
+            if let Err(error) = self.producer.poll() {
+                results.push(Err(error));
+                return results;
+            }
+            if self.shared.active.load(Ordering::Acquire)
+                && let Some(context) = &self.context
+            {
+                context.request_repaint();
+            }
+        }
+        let generation = self.shared.generation.load(Ordering::Acquire);
         for _ in 0..2 {
             let Ok(mut delivery) = self.receiver.try_recv() else {
                 break;
@@ -316,6 +392,7 @@ impl Worker {
                 }
             }
         }
+        #[cfg(not(target_arch = "wasm32"))]
         if self.handle.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.handle.take()
         {
@@ -352,7 +429,8 @@ impl Drop for Worker {
             Ok(mut mailbox) => mailbox.stopped = true,
             Err(error) => eprintln!("Stopping geometry worker: {error}"),
         }
-        self.shared.wake.notify_one();
+        self.shared.notify();
+        #[cfg(not(target_arch = "wasm32"))]
         if self.handle.as_ref().is_some_and(JoinHandle::is_finished)
             && let Some(handle) = self.handle.take()
             && handle.join().is_err()
@@ -362,16 +440,16 @@ impl Drop for Worker {
     }
 }
 
-fn deliver(
+async fn deliver(
     shared: &Shared,
     sender: &mut PacketSender,
     generation: u64,
     result: Result<Packet, ViewError>,
 ) -> bool {
-    deliver_checked(shared, sender, generation, result, None)
+    deliver_checked(shared, sender, generation, result, None).await
 }
 
-fn deliver_checked(
+async fn deliver_checked(
     shared: &Shared,
     sender: &mut PacketSender,
     generation: u64,
@@ -385,7 +463,7 @@ fn deliver_checked(
         sender.discard();
         return false;
     }
-    sender.enqueue(shared, generation, result)
+    sender.enqueue(shared, generation, result).await
 }
 
 struct PacketSender {
@@ -413,7 +491,7 @@ impl PacketSender {
         self.bytes = 256 + self.meshes.capacity() * 16;
     }
 
-    fn enqueue(
+    async fn enqueue(
         &mut self,
         shared: &Shared,
         generation: u64,
@@ -431,7 +509,9 @@ impl PacketSender {
                 } else {
                     mesh.bytes() + 32
                 };
-            if self.bytes.saturating_add(extra) > PACKET_LIMIT && !self.flush(shared, generation) {
+            if self.bytes.saturating_add(extra) > PACKET_LIMIT
+                && !self.flush(shared, generation).await
+            {
                 return false;
             }
             if let Ok(packet) = result {
@@ -457,7 +537,8 @@ impl PacketSender {
                             "Geometry delivery exceeds bounded packet budget".into(),
                         )),
                         256,
-                    );
+                    )
+                    .await;
                     return false;
                 }
                 self.bytes += extra;
@@ -465,7 +546,7 @@ impl PacketSender {
             }
             return true;
         }
-        if !self.flush(shared, generation) {
+        if !self.flush(shared, generation).await {
             return false;
         }
         let bytes = match &result {
@@ -478,9 +559,10 @@ impl PacketSender {
         } + std::mem::size_of::<Packet>() * 2
             + std::mem::size_of::<Delivery>();
         self.send(shared, generation, result.map(|packet| vec![packet]), bytes)
+            .await
     }
 
-    fn flush(&mut self, shared: &Shared, generation: u64) -> bool {
+    async fn flush(&mut self, shared: &Shared, generation: u64) -> bool {
         if self.pending.is_empty() {
             return true;
         }
@@ -495,10 +577,10 @@ impl PacketSender {
         let packets = std::mem::take(&mut self.pending);
         let bytes = self.bytes;
         self.discard();
-        self.send(shared, generation, Ok(packets), bytes)
+        self.send(shared, generation, Ok(packets), bytes).await
     }
 
-    fn send(
+    async fn send(
         &self,
         shared: &Shared,
         generation: u64,
@@ -518,23 +600,63 @@ impl PacketSender {
             accounting: shared.packet_bytes.clone(),
         };
         let _wait = WaitTime {
-            started: Some(std::time::Instant::now()),
+            started: Some(Instant::now()),
             counter: &shared.blocked_nanos,
         };
-        match self.channel.send(delivery) {
-            Ok(()) => true,
-            Err(_) => {
-                if !shared.stopped.load(Ordering::Acquire) {
-                    eprintln!("Geometry result receiver disconnected");
+        #[cfg(not(target_arch = "wasm32"))]
+        if !shared.cooperative {
+            return match self.channel.send(delivery) {
+                Ok(()) => true,
+                Err(_) => {
+                    if !shared.stopped.load(Ordering::Acquire) {
+                        eprintln!("Geometry result receiver disconnected");
+                    }
+                    false
                 }
-                false
+            };
+        }
+        let mut delivery = delivery;
+        let draws = delivery.result.as_ref().is_some_and(|result| {
+            result.as_ref().is_ok_and(|packets| {
+                !packets.is_empty()
+                    && packets
+                        .iter()
+                        .all(|packet| matches!(packet, Packet::Draw { .. }))
+            })
+        });
+        loop {
+            if shared.generation.load(Ordering::Acquire) != generation
+                || shared.stopped.load(Ordering::Acquire)
+            {
+                return false;
+            }
+            if draws
+                && self
+                    .reuse
+                    .as_ref()
+                    .is_some_and(|reuse| reuse.load(Ordering::Acquire))
+            {
+                return true;
+            }
+            match self.channel.try_send(delivery) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    delivery = returned;
+                    Pause(false).await;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    if !shared.stopped.load(Ordering::Acquire) {
+                        eprintln!("Geometry result receiver disconnected");
+                    }
+                    return false;
+                }
             }
         }
     }
 }
 
 struct WaitTime<'a> {
-    started: Option<std::time::Instant>,
+    started: Option<Instant>,
     counter: &'a AtomicU64,
 }
 
@@ -549,7 +671,7 @@ impl Drop for WaitTime<'_> {
     }
 }
 
-fn update_timing(shared: &Shared, started: std::time::Instant) {
+fn update_timing(shared: &Shared, started: Instant) {
     let elapsed = started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
     shared.preparation_nanos.store(
         elapsed.saturating_sub(shared.blocked_nanos.load(Ordering::Relaxed)),
@@ -557,54 +679,184 @@ fn update_timing(shared: &Shared, started: std::time::Instant) {
     );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn worker_loop(shared: Arc<Shared>, sender: mpsc::SyncSender<Delivery>) {
+    pollster::block_on(produce(shared, sender));
+}
+
+struct NextJob<'a>(&'a Shared);
+
+impl Future for NextJob<'_> {
+    type Output = Result<Option<Job>, ViewError>;
+
+    fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        let shared = self.0;
+        let mut mailbox = match shared.mailbox.lock() {
+            Ok(mailbox) => mailbox,
+            Err(error) => return Poll::Ready(Err(ViewError(error.to_string()))),
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        while !shared.cooperative && mailbox.pending.is_none() && !mailbox.stopped {
+            mailbox = match shared.wake.wait(mailbox) {
+                Ok(mailbox) => mailbox,
+                Err(error) => return Poll::Ready(Err(ViewError(error.to_string()))),
+            };
+        }
+        if mailbox.stopped {
+            Poll::Ready(Ok(None))
+        } else if let Some(job) = mailbox.pending.take() {
+            Poll::Ready(Ok(Some(job)))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+
+struct Checkpoint<'a> {
+    shared: &'a Shared,
+    generation: u64,
+    context: &'a egui::Context,
+    waiting: Option<WaitTime<'a>>,
+}
+
+impl Future for Checkpoint<'_> {
+    type Output = Result<(), ViewError>;
+
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+        if !self.shared.cooperative
+            || self.shared.generation.load(Ordering::Acquire) != self.generation
+            || self.shared.stopped.load(Ordering::Acquire)
+        {
+            self.waiting.take();
+            return Poll::Ready(Ok(()));
+        }
+        let mut budget = match self.shared.budget.lock() {
+            Ok(budget) => budget,
+            Err(error) => return Poll::Ready(Err(ViewError(error.to_string()))),
+        };
+        if budget.remaining != 0
+            && budget
+                .deadline
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            budget.remaining -= 1;
+            drop(budget);
+            self.waiting.take();
+            Poll::Ready(Ok(()))
+        } else {
+            drop(budget);
+            if self.waiting.is_none() {
+                self.waiting = Some(WaitTime {
+                    started: Some(Instant::now()),
+                    counter: &self.shared.blocked_nanos,
+                });
+            }
+            self.context.request_repaint();
+            Poll::Pending
+        }
+    }
+}
+
+fn checkpoint<'a>(job: &'a Job, shared: &'a Shared) -> Checkpoint<'a> {
+    Checkpoint {
+        shared,
+        generation: job.generation,
+        context: &job.context,
+        waiting: None,
+    }
+}
+
+struct Pause(bool);
+
+impl Future for Pause {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+struct Producer {
+    shared: Arc<Shared>,
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl Producer {
+    fn new(shared: Arc<Shared>, sender: mpsc::SyncSender<Delivery>) -> Self {
+        Self {
+            future: Box::pin(produce(shared.clone(), sender)),
+            shared,
+        }
+    }
+
+    fn set_budget(&mut self, duration: Duration, steps: usize) -> Result<(), ViewError> {
+        let mut budget = self
+            .shared
+            .budget
+            .lock()
+            .map_err(|error| ViewError(error.to_string()))?;
+        *budget = PreparationBudget {
+            deadline: Some(Instant::now() + duration),
+            remaining: steps,
+        };
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<(), ViewError> {
+        // Checkpoints and queue capacity are driven by repaint, so this producer
+        // needs no executor to wake it independently of the canvas.
+        if self
+            .future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_ready()
+            && !self.shared.stopped.load(Ordering::Acquire)
+        {
+            return Err(ViewError("Geometry producer stopped unexpectedly".into()));
+        }
+        Ok(())
+    }
+}
+
+async fn produce(shared: Arc<Shared>, sender: mpsc::SyncSender<Delivery>) {
     let mut sender = PacketSender::new(sender);
     let mut cache = Cache::new();
     loop {
-        let job = {
-            let mut mailbox = match shared.mailbox.lock() {
-                Ok(mailbox) => mailbox,
-                Err(error) => {
-                    eprintln!("Receiving geometry request: {error}");
-                    return;
-                }
-            };
-            while mailbox.pending.is_none() && !mailbox.stopped {
-                mailbox = match shared.wake.wait(mailbox) {
-                    Ok(mailbox) => mailbox,
-                    Err(error) => {
-                        eprintln!("Waiting for geometry request: {error}");
-                        return;
-                    }
-                };
-            }
-            if mailbox.stopped {
+        let job = match NextJob(&shared).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("Receiving geometry request: {error}");
                 return;
             }
-            mailbox.pending.take()
         };
-        if let Some(job) = job {
-            sender.discard();
-            sender.reuse = None;
-            shared.active.store(true, Ordering::Relaxed);
-            shared.preparation_nanos.store(0, Ordering::Relaxed);
-            shared.blocked_nanos.store(0, Ordering::Relaxed);
-            #[cfg(test)]
-            shared.complete_leaf_cells.store(0, Ordering::Relaxed);
-            let started = std::time::Instant::now();
-            if let Err(error) = render_job(&job, &shared, &mut sender, &mut cache, started)
-                && shared.generation.load(Ordering::Acquire) == job.generation
-            {
-                deliver(&shared, &mut sender, job.generation, Err(error));
-                job.context.request_repaint();
-            }
-            shared
-                .cache_bytes
-                .store(cache.total_bytes(), Ordering::Relaxed);
-            update_timing(&shared, started);
-            shared.active.store(false, Ordering::Relaxed);
-            sender.discard();
+        sender.discard();
+        sender.reuse = None;
+        shared.active.store(true, Ordering::Relaxed);
+        shared.preparation_nanos.store(0, Ordering::Relaxed);
+        shared.blocked_nanos.store(0, Ordering::Relaxed);
+        #[cfg(test)]
+        shared.complete_leaf_cells.store(0, Ordering::Relaxed);
+        let started = Instant::now();
+        if let Err(error) = render_job(&job, &shared, &mut sender, &mut cache, started).await
+            && shared.generation.load(Ordering::Acquire) == job.generation
+        {
+            deliver(&shared, &mut sender, job.generation, Err(error)).await;
+            job.context.request_repaint();
         }
+        shared
+            .cache_bytes
+            .store(cache.total_bytes(), Ordering::Relaxed);
+        update_timing(&shared, started);
+        shared.active.store(false, Ordering::Relaxed);
+        sender.discard();
     }
 }
 
@@ -2073,7 +2325,7 @@ struct Planner<'a> {
     batch_bytes: usize,
     batch_limit: usize,
     reuse: Arc<AtomicBool>,
-    started: std::time::Instant,
+    started: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -2277,12 +2529,12 @@ impl Affine {
     }
 }
 
-fn render_job(
+async fn render_job(
     job: &Job,
     shared: &Shared,
     sender: &mut PacketSender,
     cache: &mut Cache,
-    started: std::time::Instant,
+    started: Instant,
 ) -> Result<(), ViewError> {
     let physical_width = f64::from(job.key.viewport.width()) * f64::from(job.key.pixels_per_point);
     let physical_height =
@@ -2365,6 +2617,7 @@ fn render_job(
     let visibility_bytes = leaf_visibility.capacity() * std::mem::size_of::<Option<bool>>();
     let tile_count = tiles.len();
     for (tile_index, (column, row, left, top)) in tiles.into_iter().enumerate() {
+        checkpoint(job, shared).await?;
         if shared.generation.load(Ordering::Acquire) != job.generation {
             return Ok(());
         }
@@ -2434,7 +2687,9 @@ fn render_job(
                     first_group: group_index == 0,
                     reuse: reuse.clone(),
                 }),
-            ) {
+            )
+            .await
+            {
                 return Ok(());
             }
             job.context.request_repaint();
@@ -2457,12 +2712,12 @@ fn render_job(
                 reuse: reuse.clone(),
                 started,
             };
-            if let Err(error) = planner.paint()
+            if let Err(error) = planner.paint().await
                 && !planner.finished()
             {
                 return Err(error);
             }
-            planner.flush()?;
+            planner.flush().await?;
             if !deliver(
                 shared,
                 sender,
@@ -2473,7 +2728,9 @@ fn render_job(
                     last_group: group_index + 1 == group_count,
                     complete: tile_index + 1 == tile_count && group_index + 1 == group_count,
                 }),
-            ) {
+            )
+            .await
+            {
                 return Ok(());
             }
             job.context.request_repaint();
@@ -2574,7 +2831,7 @@ impl Planner<'_> {
         }
     }
 
-    fn paint(&mut self) -> Result<(), ViewError> {
+    async fn paint(&mut self) -> Result<(), ViewError> {
         if self.layers.is_empty() {
             return Ok(());
         }
@@ -2584,6 +2841,7 @@ impl Planner<'_> {
         };
         let mut stack = vec![Work::Cell(selected, Transformation::default(), 0, 1, None)];
         while let Some(work) = stack.pop() {
+            checkpoint(job, self.shared).await?;
             if self.finished() {
                 return Ok(());
             }
@@ -2726,7 +2984,8 @@ impl Planner<'_> {
                                 cursor.transformation,
                                 cursor.multiplicity,
                                 cursor.lattice,
-                            )?;
+                            )
+                            .await?;
                         }
                     }
                     if scene
@@ -2749,6 +3008,7 @@ impl Planner<'_> {
                                     cursor.multiplicity,
                                     cursor.lattice,
                                 )
+                                .await
                                 .map_err(|error| {
                                     shape_error(
                                         source.name(),
@@ -2891,6 +3151,7 @@ impl Planner<'_> {
                                     cursor.multiplicity,
                                     cursor.lattice,
                                 )
+                                .await
                                 .map_err(|error| {
                                     shape_error(cell.name(), shape.layer, entry.index, error)
                                 })?;
@@ -2938,7 +3199,8 @@ impl Planner<'_> {
                                                 cursor.transformation,
                                                 cursor.multiplicity,
                                                 cursor.lattice,
-                                            )?;
+                                            )
+                                            .await?;
                                         }
                                     }
                                 }
@@ -2981,7 +3243,7 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), ViewError> {
+    async fn flush(&mut self) -> Result<(), ViewError> {
         if self.reuse.load(Ordering::Acquire) {
             self.batches.clear();
             self.batch_bytes = 0;
@@ -2997,7 +3259,7 @@ impl Planner<'_> {
             if self.finished() {
                 break;
             }
-            if !self.deliver_batch(batch) {
+            if !self.deliver_batch(batch).await {
                 break;
             }
         }
@@ -3005,7 +3267,7 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn deliver_batch(&mut self, batch: PendingDraw) -> bool {
+    async fn deliver_batch(&mut self, batch: PendingDraw) -> bool {
         let delivered = deliver_checked(
             self.shared,
             self.sender,
@@ -3020,22 +3282,23 @@ impl Planner<'_> {
                 shape_count: batch.shape_count,
             }),
             Some(&self.reuse),
-        );
+        )
+        .await;
         self.job.context.request_repaint();
         update_timing(self.shared, self.started);
         delivered
     }
 
-    fn flush_batch(&mut self, key: BatchKey) {
+    async fn flush_batch(&mut self, key: BatchKey) {
         if let Some(batch) = self.batches.remove(&key) {
             let bytes =
                 batch.mesh.bytes() + batch.instances.capacity() * std::mem::size_of::<Instance>();
             self.batch_bytes = self.batch_bytes.saturating_sub(bytes);
-            self.deliver_batch(batch);
+            self.deliver_batch(batch).await;
         }
     }
 
-    fn append(
+    async fn append(
         &mut self,
         layer: LayerKey,
         mesh: Arc<MeshData>,
@@ -3043,9 +3306,10 @@ impl Planner<'_> {
         shape_count: usize,
     ) -> Result<(), ViewError> {
         self.append_array(layer, mesh, instance, None, shape_count)
+            .await
     }
 
-    fn append_array(
+    async fn append_array(
         &mut self,
         layer: LayerKey,
         mesh: Arc<MeshData>,
@@ -3098,11 +3362,11 @@ impl Planner<'_> {
             false
         };
         if full {
-            self.flush_batch(key);
+            self.flush_batch(key).await;
         }
         let extra = mesh.bytes() + instance_bytes;
         if self.batch_bytes.saturating_add(extra) > self.batch_limit {
-            self.flush()?;
+            self.flush().await?;
         }
         self.batches.insert(
             key,
@@ -3118,7 +3382,7 @@ impl Planner<'_> {
         Ok(())
     }
 
-    fn draw_array(
+    async fn draw_array(
         &mut self,
         layer: LayerKey,
         mesh: Arc<MeshData>,
@@ -3127,9 +3391,10 @@ impl Planner<'_> {
         count: usize,
     ) -> Result<(), ViewError> {
         self.append_array(layer, mesh, instance, Some(array), count)
+            .await
     }
 
-    fn mesh(
+    async fn mesh(
         &mut self,
         mesh: &PreparedMesh,
         transformation: Transformation,
@@ -3169,16 +3434,19 @@ impl Planner<'_> {
                 array,
                 self.job.key.camera.pixels_per_unit * self.scale,
             ) {
-                return self.draw_array(
-                    mesh.layer,
-                    mesh.data.clone(),
-                    affine.instance(),
-                    array,
-                    count,
-                );
+                return self
+                    .draw_array(
+                        mesh.layer,
+                        mesh.data.clone(),
+                        affine.instance(),
+                        array,
+                        count,
+                    )
+                    .await;
             }
             for row in 0..lattice.rows {
                 for column in 0..lattice.columns {
+                    checkpoint(self.job, self.shared).await?;
                     if self.finished() {
                         return Ok(());
                     }
@@ -3202,12 +3470,14 @@ impl Planner<'_> {
                         base_count.saturating_mul(
                             self.owned(projection.apply(mesh.origin, center), None),
                         ),
-                    )?;
+                    )
+                    .await?;
                 }
             }
             Ok(())
         } else if affine.precise(mesh) {
             self.append(mesh.layer, mesh.data.clone(), affine.instance(), count)
+                .await
         } else {
             let projection = Projection::new(
                 transformation,
@@ -3221,10 +3491,11 @@ impl Planner<'_> {
                 transformation,
                 base_count.saturating_mul(self.owned(projection.apply(mesh.origin, center), None)),
             )
+            .await
         }
     }
 
-    fn label(
+    async fn label(
         &mut self,
         label: &Label,
         layer: LayerKey,
@@ -3285,6 +3556,7 @@ impl Planner<'_> {
                 self.job.key.camera.pixels_per_unit * self.scale,
             ) {
                 self.draw_array(layer, glyph.mesh.clone(), affine.instance(), array, count)
+                    .await
             } else {
                 let scale = self.job.key.camera.pixels_per_unit * self.scale;
                 let column_step =
@@ -3292,6 +3564,7 @@ impl Planner<'_> {
                 let row_step = DoublePoint::new(lattice.row.x, -lattice.row.y).times(scale);
                 for row in 0..lattice.rows {
                     for column in 0..lattice.columns {
+                        checkpoint(self.job, self.shared).await?;
                         if self.finished() {
                             return Ok(());
                         }
@@ -3307,13 +3580,15 @@ impl Planner<'_> {
                             glyph.mesh.clone(),
                             translated.instance(),
                             multiplicity.saturating_mul(self.owned(translated.apply(center), None)),
-                        )?;
+                        )
+                        .await?;
                     }
                 }
                 Ok(())
             }
         } else {
             self.append(layer, glyph.mesh.clone(), affine.instance(), count)
+                .await
         }
     }
 
@@ -3371,7 +3646,7 @@ impl Planner<'_> {
         count
     }
 
-    fn precise_mesh(
+    async fn precise_mesh(
         &mut self,
         mesh: &PreparedMesh,
         transformation: Transformation,
@@ -3394,6 +3669,7 @@ impl Planner<'_> {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
         for triangle in mesh.data.indices.as_chunks::<3>().0 {
+            checkpoint(self.job, self.shared).await?;
             if self.finished() {
                 return Ok(());
             }
@@ -3519,7 +3795,8 @@ impl Planner<'_> {
                         translation: [0.0; 2],
                     },
                     0,
-                )?;
+                )
+                .await?;
             }
         }
         if !vertices.is_empty() {
@@ -3537,7 +3814,8 @@ impl Planner<'_> {
                     translation: [0.0; 2],
                 },
                 count,
-            )?;
+            )
+            .await?;
         }
         Ok(())
     }
@@ -3781,6 +4059,343 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         Err("Geometry worker did not finish".into())
+    }
+
+    fn cooperative_producer() -> (Producer, mpsc::Receiver<Delivery>) {
+        let shared = Shared::new(true);
+        let (sender, receiver) = mpsc::sync_channel(2);
+        (Producer::new(shared, sender), receiver)
+    }
+
+    fn queue_job(
+        producer: &Producer,
+        scene: Arc<Scene>,
+        key: FrameKey,
+        generation: u64,
+    ) -> Result<(), Box<dyn Error>> {
+        producer
+            .shared
+            .generation
+            .store(generation, Ordering::Release);
+        producer
+            .shared
+            .mailbox
+            .lock()
+            .map_err(|error| ViewError(error.to_string()))?
+            .pending = Some(Job {
+            generation,
+            scene,
+            key,
+            context: egui::Context::default(),
+            preview: false,
+        });
+        Ok(())
+    }
+
+    fn drain_producer(
+        producer: &mut Producer,
+        receiver: &mpsc::Receiver<Delivery>,
+        steps: usize,
+        reuse_tiles: bool,
+    ) -> Result<Vec<Packet>, Box<dyn Error>> {
+        let generation = producer.shared.generation.load(Ordering::Acquire);
+        let mut packets = Vec::new();
+        for _ in 0..10_000 {
+            producer.set_budget(Duration::from_secs(1), steps)?;
+            producer.poll()?;
+            for mut delivery in receiver.try_iter() {
+                assert!(delivery.bytes <= PACKET_LIMIT);
+                if delivery.generation != generation {
+                    continue;
+                }
+                for packet in delivery
+                    .result
+                    .take()
+                    .ok_or("Missing cooperative result")??
+                {
+                    if reuse_tiles && let Packet::Begin { reuse, .. } = &packet {
+                        reuse.store(true, Ordering::Release);
+                    }
+                    let complete = matches!(packet, Packet::Finish { complete: true, .. });
+                    packets.push(packet);
+                    if complete {
+                        return Ok(packets);
+                    }
+                }
+            }
+        }
+        Err("Cooperative geometry producer did not finish".into())
+    }
+
+    fn packet_signature(packets: Vec<Packet>) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let mut tiles = HashMap::new();
+        let mut signature = Vec::new();
+        for packet in packets {
+            let mut bytes = Vec::new();
+            match packet {
+                Packet::Begin {
+                    tile,
+                    layers,
+                    first_group,
+                    ..
+                } => {
+                    tiles.insert(tile.id, tile.grid);
+                    bytes.push(0);
+                    bytes.extend(bytemuck::bytes_of(&tile.grid));
+                    bytes.extend(bytemuck::bytes_of(&tile.phase));
+                    bytes.extend(tile.density.to_le_bytes());
+                    bytes.push(u8::from(first_group));
+                    for (layer, style) in layers {
+                        bytes.extend(layer.layer.to_le_bytes());
+                        bytes.extend(layer.datatype.to_le_bytes());
+                        bytes.extend(style.color.to_array());
+                    }
+                }
+                Packet::Draw {
+                    tile_id,
+                    layer,
+                    mesh,
+                    instances,
+                    array,
+                    shape_count,
+                    ..
+                } => {
+                    bytes.push(1);
+                    bytes.extend(bytemuck::bytes_of(
+                        tiles.get(&tile_id).ok_or("Missing signature tile")?,
+                    ));
+                    bytes.extend(layer.layer.to_le_bytes());
+                    bytes.extend(layer.datatype.to_le_bytes());
+                    bytes.extend(bytemuck::cast_slice::<_, u8>(&mesh.vertices));
+                    bytes.extend(bytemuck::cast_slice::<_, u8>(&mesh.indices));
+                    bytes.extend(bytemuck::cast_slice::<_, u8>(&instances));
+                    if let Some(array) = array {
+                        bytes.extend(bytemuck::bytes_of(&array.column_step));
+                        bytes.extend(bytemuck::bytes_of(&array.row_step));
+                        bytes.extend(array.columns.to_le_bytes());
+                        bytes.extend(array.rows.to_le_bytes());
+                    }
+                    bytes.extend(shape_count.to_le_bytes());
+                }
+                Packet::Finish {
+                    tile_id,
+                    last_group,
+                    complete,
+                    ..
+                } => {
+                    bytes.push(2);
+                    bytes.extend(bytemuck::bytes_of(
+                        tiles
+                            .get(&tile_id)
+                            .ok_or("Missing completed signature tile")?,
+                    ));
+                    bytes.extend([u8::from(last_group), u8::from(complete)]);
+                }
+            }
+            signature.push(bytes);
+        }
+        Ok(signature)
+    }
+
+    #[test]
+    fn cooperative_budget_suspends_and_preserves_native_packet_stream() -> Result<(), Box<dyn Error>>
+    {
+        let scene = fixture(rectangle())?;
+        let mut key = request();
+        key.viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(512.0));
+        for layer in 2..=70 {
+            key.styles.insert(
+                LayerKey { layer, datatype: 0 },
+                LayerStyle {
+                    visible: true,
+                    color: Color32::GREEN,
+                },
+            );
+        }
+        let (mut producer, receiver) = cooperative_producer();
+        queue_job(&producer, scene.clone(), key.clone(), 1)?;
+        producer.set_budget(Duration::from_secs(1), 0)?;
+        producer.poll()?;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(producer.shared.active.load(Ordering::Acquire));
+        producer.set_budget(Duration::ZERO, usize::MAX)?;
+        producer.poll()?;
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let stepped = drain_producer(&mut producer, &receiver, 1, false)?;
+        let mut worker = Worker::new()?;
+        worker.start(scene, key, egui::Context::default(), false)?;
+        assert_eq!(
+            packet_signature(stepped)?,
+            packet_signature(drain(&mut worker, false)?)?
+        );
+        assert_eq!(producer.shared.packet_bytes.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_full_queue_cancels_without_growing_or_leaking_deliveries()
+    -> Result<(), Box<dyn Error>> {
+        let scene = fixture(rectangle())?;
+        let (mut producer, receiver) = cooperative_producer();
+        queue_job(&producer, scene.clone(), request(), 1)?;
+        producer.set_budget(Duration::from_secs(1), usize::MAX)?;
+        producer.poll()?;
+        let retained = producer.shared.packet_bytes.load(Ordering::Relaxed);
+        assert!(retained > 0 && retained <= PACKET_LIMIT * 3);
+        for _ in 0..4 {
+            producer.poll()?;
+            assert_eq!(
+                producer.shared.packet_bytes.load(Ordering::Relaxed),
+                retained
+            );
+        }
+        queue_job(&producer, scene, request(), 2)?;
+        for delivery in receiver.try_iter() {
+            assert_eq!(delivery.generation, 1);
+        }
+        let packets = drain_producer(&mut producer, &receiver, 1, false)?;
+        assert!(packets.iter().all(|packet| match packet {
+            Packet::Begin { generation, .. }
+            | Packet::Draw { generation, .. }
+            | Packet::Finish { generation, .. } => *generation == 2,
+        }));
+        assert_eq!(producer.shared.packet_bytes.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_reused_tiles_preserve_group_finishes_and_later_tiles()
+    -> Result<(), Box<dyn Error>> {
+        let (mut producer, receiver) = cooperative_producer();
+        let mut key = request();
+        key.viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(512.0));
+        for layer in 2..=70 {
+            key.styles.insert(
+                LayerKey { layer, datatype: 0 },
+                LayerStyle {
+                    visible: true,
+                    color: Color32::GREEN,
+                },
+            );
+        }
+        queue_job(&producer, fixture(rectangle())?, key, 1)?;
+        let packets = drain_producer(&mut producer, &receiver, 1, true)?;
+        let begins = packets
+            .iter()
+            .filter(|packet| matches!(packet, Packet::Begin { .. }))
+            .count();
+        let finishes = packets
+            .iter()
+            .filter(|packet| matches!(packet, Packet::Finish { .. }))
+            .count();
+        assert!(begins > 2);
+        assert_eq!(begins, finishes);
+        assert!(matches!(
+            packets.last(),
+            Some(Packet::Finish { complete: true, .. })
+        ));
+        assert_eq!(producer.shared.packet_bytes.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cooperative_reuse_drops_suspended_draws_without_dropping_finish()
+    -> Result<(), Box<dyn Error>> {
+        let shared = Shared::new(true);
+        let (channel, receiver) = mpsc::sync_channel(2);
+        let mut sender = PacketSender::new(channel);
+        let key = request();
+        let reuse = Arc::new(AtomicBool::new(false));
+        let tile = TileInfo {
+            id: 1,
+            rect: key.viewport,
+            size: [256, 256],
+            preview: false,
+            grid: [0, 0],
+            phase: [0.0, 0.0],
+            density: 1.0,
+            crop: key.viewport,
+        };
+        let mut future = Box::pin(async {
+            for _ in 0..2 {
+                assert!(
+                    sender
+                        .enqueue(
+                            &shared,
+                            0,
+                            Ok(Packet::Begin {
+                                generation: 0,
+                                tile,
+                                layers: Vec::new(),
+                                first_group: true,
+                                reuse: reuse.clone(),
+                            })
+                        )
+                        .await
+                );
+            }
+            assert!(
+                sender
+                    .send(
+                        &shared,
+                        0,
+                        Ok(vec![Packet::Draw {
+                            generation: 0,
+                            tile_id: 1,
+                            layer: LayerKey {
+                                layer: 1,
+                                datatype: 0
+                            },
+                            mesh: Arc::new(MeshData {
+                                id: 1,
+                                vertices: Vec::new(),
+                                indices: Vec::new(),
+                                glyph: None
+                            }),
+                            instances: Vec::new(),
+                            array: None,
+                            shape_count: 1,
+                        }]),
+                        256
+                    )
+                    .await
+            );
+            sender
+                .enqueue(
+                    &shared,
+                    0,
+                    Ok(Packet::Finish {
+                        generation: 0,
+                        tile_id: 1,
+                        last_group: true,
+                        complete: true,
+                    }),
+                )
+                .await
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        reuse.store(true, Ordering::Release);
+        assert!(future.as_mut().poll(&mut context).is_pending());
+        let queued = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(queued.len(), 2);
+        assert_eq!(future.as_mut().poll(&mut context), Poll::Ready(true));
+        let mut finish = receiver.try_recv()?;
+        let packets = finish.result.take().ok_or("Missing reused completion")??;
+        assert!(matches!(
+            packets.as_slice(),
+            [Packet::Finish { complete: true, .. }]
+        ));
+        drop(finish);
+        drop(queued);
+        assert_eq!(shared.packet_bytes.load(Ordering::Relaxed), 0);
+        Ok(())
     }
 
     #[test]
@@ -4432,7 +5047,7 @@ mod tests {
             density: 1.0,
             crop: Rect::from_min_size(Pos2::ZERO, Vec2::splat(256.0)),
         };
-        assert!(deliver(
+        assert!(pollster::block_on(deliver(
             &worker.shared,
             &mut sender,
             0,
@@ -4443,7 +5058,7 @@ mod tests {
                 first_group: true,
                 reuse: Arc::new(AtomicBool::new(false)),
             })
-        ));
+        )));
         let mut begin = receiver.try_recv()?;
         assert!(
             matches!(begin.result.take(), Some(Ok(packets)) if matches!(packets.first(), Some(Packet::Begin { .. })))
@@ -4455,7 +5070,7 @@ mod tests {
             glyph: None,
         });
         for _ in 0..2000 {
-            assert!(deliver(
+            assert!(pollster::block_on(deliver(
                 &worker.shared,
                 &mut sender,
                 0,
@@ -4477,13 +5092,13 @@ mod tests {
                     array: None,
                     shape_count: 100,
                 })
-            ));
+            )));
         }
         let mut first = receiver.try_recv()?;
         assert!(first.bytes <= PACKET_LIMIT);
         let first_packets = first.result.take().ok_or("Missing first delivery")??;
         assert!(first_packets.len() > 100);
-        assert!(deliver(
+        assert!(pollster::block_on(deliver(
             &worker.shared,
             &mut sender,
             0,
@@ -4493,7 +5108,7 @@ mod tests {
                 last_group: true,
                 complete: true,
             })
-        ));
+        )));
         let mut second = receiver.try_recv()?;
         assert!(second.bytes <= PACKET_LIMIT);
         let second_packets = second.result.take().ok_or("Missing second delivery")??;

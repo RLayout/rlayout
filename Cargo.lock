@@ -1943,9 +1943,14 @@ name = "rlayout-app"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "js-sys",
  "pollster",
  "rlayout-gds",
  "rlayout-viewer",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -1970,6 +1975,7 @@ dependencies = [
  "pollster",
  "rlayout-core",
  "tess2-rust",
+ "web-time",
 ]
 
 [[package]]

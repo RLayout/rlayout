@@ -1,0 +1,8 @@
+[build]
+target = "index.html"
+dist = "target/web-dist"
+public_url = "/"
+locked = true
+
+[tools]
+wasm_bindgen = "0.2.130"
