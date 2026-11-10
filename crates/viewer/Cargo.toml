@@ -11,7 +11,15 @@ path = "src/viewer.rs"
 [dependencies]
 rlayout-core.workspace = true
 egui.workspace = true
+egui-wgpu.workspace = true
+bytemuck.workspace = true
 tess2-rust.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-time = "=1.1.0"
 
 [lints]
 workspace = true

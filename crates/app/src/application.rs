@@ -26,7 +26,7 @@ pub use web::WebHandle;
 
 use eframe::egui;
 use rlayout_gds::Diagnostic;
-use rlayout_viewer::{Scene, Viewer};
+use rlayout_viewer::{GpuRendererHandle, Scene, Viewer};
 
 struct LoadedDocument {
     scene: Scene,
@@ -88,6 +88,7 @@ fn load_reader(reader: impl Read, cancel: Arc<AtomicBool>) -> Result<LoadedDocum
 
 struct Application {
     viewer: Option<Viewer>,
+    renderer: Option<GpuRendererHandle>,
     sender: mpsc::Sender<LoadMessage>,
     receiver: mpsc::Receiver<LoadMessage>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -101,6 +102,7 @@ struct Application {
     document_path: Option<PathBuf>,
     warnings: Vec<Diagnostic>,
     error: Option<String>,
+    render_error: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
     open_dialog: bool,
     warnings_dialog: bool,
@@ -114,12 +116,14 @@ struct Application {
 impl Application {
     fn new(
         context: &egui::Context,
+        renderer: Option<GpuRendererHandle>,
         #[cfg(not(target_arch = "wasm32"))] path: Option<PathBuf>,
     ) -> Self {
         context.set_theme(egui::ThemePreference::Dark);
         let (sender, receiver) = mpsc::channel();
         let application = Self {
             viewer: None,
+            renderer: renderer.clone(),
             sender,
             receiver,
             #[cfg(not(target_arch = "wasm32"))]
@@ -133,12 +137,17 @@ impl Application {
             document_path: None,
             warnings: Vec::new(),
             error: None,
+            render_error: None,
             #[cfg(not(target_arch = "wasm32"))]
             open_dialog: false,
             warnings_dialog: false,
             #[cfg(not(target_arch = "wasm32"))]
             path_text: String::new(),
-            status: "Open a GDSII file to begin".into(),
+            status: if renderer.is_some() {
+                "Open a GDSII file to begin".into()
+            } else {
+                "Initializing renderer…".into()
+            },
             #[cfg(not(target_arch = "wasm32"))]
             focus_path: false,
         };
@@ -270,25 +279,42 @@ impl Application {
                     self.loading = None;
                     match message.result {
                         Ok(document) => {
-                            self.status = format!(
-                                "Loaded in {:.0} ms",
-                                document.elapsed.as_secs_f64() * 1000.0
-                            );
-                            self.warnings = document.warnings;
-                            self.warnings_dialog = !self.warnings.is_empty();
-                            self.viewer = Some(Viewer::new(document.scene));
-                            context.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                                "{} — RLayout",
-                                message.path.display()
-                            )));
-                            #[cfg(target_arch = "wasm32")]
-                            if let Some(document) =
-                                web_sys::window().and_then(|window| window.document())
-                            {
-                                document
-                                    .set_title(&format!("{} — RLayout", message.path.display()));
+                            let viewer = self
+                                .renderer
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    rlayout_viewer::ViewError("Renderer is not initialized".into())
+                                })
+                                .and_then(|renderer| Viewer::new(document.scene, renderer.clone()));
+                            match viewer {
+                                Ok(viewer) => {
+                                    self.status = format!(
+                                        "Loaded in {:.0} ms",
+                                        document.elapsed.as_secs_f64() * 1000.0
+                                    );
+                                    self.warnings = document.warnings;
+                                    self.warnings_dialog = !self.warnings.is_empty();
+                                    self.viewer = Some(viewer);
+                                    self.render_error = None;
+                                    context.send_viewport_cmd(egui::ViewportCommand::Title(
+                                        format!("{} — RLayout", message.path.display()),
+                                    ));
+                                    #[cfg(target_arch = "wasm32")]
+                                    if let Some(document) =
+                                        web_sys::window().and_then(|window| window.document())
+                                    {
+                                        document.set_title(&format!(
+                                            "{} — RLayout",
+                                            message.path.display()
+                                        ));
+                                    }
+                                    self.document_path = Some(message.path);
+                                }
+                                Err(error) => {
+                                    self.status = "Rendering initialization failed".into();
+                                    self.error = Some(error.to_string());
+                                }
                             }
-                            self.document_path = Some(message.path);
                         }
                         Err(error) => {
                             self.status = "Loading failed".into();
@@ -424,6 +450,14 @@ impl eframe::App for Application {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        if self.renderer.is_none() {
+            egui::CentralPanel::default().show(ui, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(&self.status);
+                });
+            });
+            return;
+        }
         let open_shortcut =
             context.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::O));
         if open_shortcut {
@@ -501,7 +535,11 @@ impl eframe::App for Application {
                         {
                             ui.label(cell.name());
                         }
-                        ui.label(format!("{} visible shapes", viewer.visible_shape_count()));
+                        ui.label(format!("~{} rendered shapes", viewer.visible_shape_count()));
+                        if !viewer.rendering_complete() && viewer.error.is_none() {
+                            ui.spinner();
+                            ui.label("Rendering…");
+                        }
                         if let Some(cursor) = viewer.cursor {
                             let microns = viewer.layout().meters_per_unit() * 1e6;
                             ui.label(format!(
@@ -522,6 +560,13 @@ impl eframe::App for Application {
                 ui.centered_and_justified(|ui| { ui.label("Open a GDSII layout with File > Open or drag and drop.\nWheel: zoom · Middle drag: pan · F: fit"); });
             }
         });
+        let render_error = self.viewer.as_ref().and_then(|viewer| viewer.error.clone());
+        if render_error != self.render_error {
+            if let Some(error) = &render_error {
+                self.error = Some(error.clone());
+            }
+            self.render_error = render_error;
+        }
         self.show_dialogs(&context);
     }
 }
@@ -542,7 +587,18 @@ pub fn run_native() -> Result<(), Box<dyn Error>> {
     eframe::run_native(
         "RLayout",
         options,
-        Box::new(move |context| Ok(Box::new(Application::new(&context.egui_ctx, path)))),
+        Box::new(move |context| {
+            let state = context
+                .wgpu_render_state
+                .as_ref()
+                .ok_or("WGPU renderer is unavailable")?;
+            let renderer = GpuRendererHandle::from_render_state(state)?;
+            Ok(Box::new(Application::new(
+                &context.egui_ctx,
+                Some(renderer),
+                path,
+            )))
+        }),
     )?;
     Ok(())
 }
@@ -554,7 +610,20 @@ mod fixtures;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use rlayout_viewer::ViewError;
     use std::sync::atomic::AtomicU64;
+
+    fn test_renderer() -> Result<GpuRendererHandle, ViewError> {
+        static RENDERER: std::sync::OnceLock<Result<GpuRendererHandle, String>> =
+            std::sync::OnceLock::new();
+        RENDERER
+            .get_or_init(|| {
+                pollster::block_on(GpuRendererHandle::headless()).map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .cloned()
+            .map_err(|error| ViewError(error.clone()))
+    }
 
     struct TestDirectory(PathBuf);
 
@@ -619,7 +688,7 @@ mod tests {
     #[test]
     fn stale_loading_results_and_errors_keep_the_current_document() -> Result<(), Box<dyn Error>> {
         let context = egui::Context::default();
-        let mut application = Application::new(&context, None);
+        let mut application = Application::new(&context, Some(test_renderer()?), None);
         application.generation = 2;
         application.sender.send(LoadMessage {
             generation: 2,
@@ -658,7 +727,7 @@ mod tests {
         let directory = TestDirectory::new()?;
         let path = directory.write("demo.gds", &fixtures::demo()?)?;
         let context = egui::Context::default();
-        let mut application = Application::new(&context, None);
+        let mut application = Application::new(&context, Some(test_renderer()?), None);
         application.start_load(path, &context);
         let deadline = Instant::now() + Duration::from_secs(5);
         while application.loading.is_some() && Instant::now() < deadline {
@@ -681,6 +750,36 @@ mod tests {
     }
 
     #[test]
+    fn renderer_initialization_failure_keeps_the_current_document() -> Result<(), Box<dyn Error>> {
+        let context = egui::Context::default();
+        let mut application = Application::new(&context, Some(test_renderer()?), None);
+        application.sender.send(LoadMessage {
+            generation: 0,
+            path: PathBuf::from("original.gds"),
+            result: Ok(document()?),
+        })?;
+        application.receive_loads(&context);
+        application.renderer = None;
+        application.sender.send(LoadMessage {
+            generation: 0,
+            path: PathBuf::from("replacement.gds"),
+            result: Ok(document()?),
+        })?;
+        application.receive_loads(&context);
+        assert_eq!(
+            application.document_path,
+            Some(PathBuf::from("original.gds"))
+        );
+        assert!(application.viewer.is_some());
+        assert_eq!(
+            application.error.as_deref(),
+            Some("Renderer is not initialized")
+        );
+        assert_eq!(application.status, "Rendering initialization failed");
+        Ok(())
+    }
+
+    #[test]
     fn generated_fixtures_load_and_render_complete_layouts() -> Result<(), Box<dyn Error>> {
         let directory = TestDirectory::new()?;
         for (file, bytes, cells, shapes) in [
@@ -697,7 +796,7 @@ mod tests {
                 "Unexpected warnings: {:?}",
                 document.warnings
             );
-            let mut viewer = Viewer::new(document.scene);
+            let mut viewer = Viewer::new(document.scene, test_renderer()?)?;
             assert_eq!(
                 viewer
                     .selected
@@ -712,15 +811,11 @@ mod tests {
                 viewer.selected.and_then(|id| viewer.layout().bounds(id)),
                 viewport,
             );
-            let mut rendered = None;
-            let mut output = context.run_ui(egui::RawInput::default(), |ui| {
-                rendered = Some(viewer.render(ui.ctx(), viewport));
-            });
+            let mut output = context.run_ui(egui::RawInput::default(), |_| {});
             output.textures_delta.clear();
-            let frame = rendered.ok_or("No rendered fixture frame")??;
-            assert!(frame.shape_count > 0);
-            assert!(!frame.truncated);
-            assert!(frame.meshes.iter().any(|mesh| !mesh.indices.is_empty()));
+            let image = pollster::block_on(viewer.render_image(&context, viewport))?;
+            assert!(image.shape_count > 0);
+            assert!(image.image.pixels.iter().any(|pixel| pixel.a() != 0));
         }
         Ok(())
     }
@@ -744,7 +839,7 @@ mod tests {
         let directory = TestDirectory::new()?;
         let path = directory.write("demo.gds", &fixtures::demo()?)?;
         let context = egui::Context::default();
-        let mut application = Application::new(&context, None);
+        let mut application = Application::new(&context, Some(test_renderer()?), None);
         let mut frame = eframe::Frame::_new_kittest();
         for (index, opened_path) in [path.clone(), directory.0.join("missing-drop.gds")]
             .into_iter()

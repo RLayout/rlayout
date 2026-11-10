@@ -92,8 +92,9 @@ fn nested_transforms_preserve_known_coordinates() -> Result<(), Box<dyn Error>> 
 }
 
 #[test]
-fn missing_duplicate_and_cyclic_cells_fail() -> Result<(), Box<dyn Error>> {
-    for referenced in ["MISSING", "TOP"] {
+fn duplicate_and_cyclic_cells_fail() -> Result<(), Box<dyn Error>> {
+    {
+        let referenced = "TOP";
         let mut fixture = Fixture::new()?;
         fixture.cell("TOP")?;
         fixture.reference(referenced, (0, 0), false, 0.0, 1.0)?;
@@ -102,11 +103,7 @@ fn missing_duplicate_and_cyclic_cells_fail() -> Result<(), Box<dyn Error>> {
         let error = read(fixture.bytes.as_slice())
             .err()
             .ok_or("Expected reference error")?;
-        assert!(error.message.contains(if referenced == "TOP" {
-            "Cyclic"
-        } else {
-            "Unresolved"
-        }));
+        assert!(error.message.contains("Cyclic"));
     }
     let mut fixture = Fixture::new()?;
     for _ in 0..2 {
@@ -138,7 +135,7 @@ fn malformed_and_truncated_records_report_offsets() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-fn unsupported_geometry_is_an_error_with_element_context() -> Result<(), Box<dyn Error>> {
+fn malformed_geometry_is_an_error_with_element_context() -> Result<(), Box<dyn Error>> {
     let mut fixture = Fixture::new()?;
     fixture.cell("TOP")?;
     fixture.record(0x0a, 0, &[])?;
@@ -149,7 +146,7 @@ fn unsupported_geometry_is_an_error_with_element_context() -> Result<(), Box<dyn
         .ok_or("Expected STRANS error")?;
     assert_eq!(error.cell.as_deref(), Some("TOP"));
     assert_eq!(error.element, Some("SREF"));
-    assert!(error.message.contains("Absolute"));
+    assert!(error.message.contains("Reading record header"));
     Ok(())
 }
 
@@ -184,7 +181,7 @@ fn invalid_units_are_rejected_at_the_units_record() -> Result<(), Box<dyn Error>
 }
 
 #[test]
-fn unsupported_path_contours_keep_cell_and_element_context() -> Result<(), Box<dyn Error>> {
+fn degenerate_and_overlapping_paths_do_not_abort_loading() -> Result<(), Box<dyn Error>> {
     for points in [
         vec![],
         vec![(0, 0), (0, 0)],
@@ -193,26 +190,33 @@ fn unsupported_path_contours_keep_cell_and_element_context() -> Result<(), Box<d
         let mut fixture = Fixture::new()?;
         fixture.cell("TOP")?;
         fixture.path(1, 0, 2, &points)?;
-        let error = read(fixture.bytes.as_slice())
-            .err()
-            .ok_or("Accepted invalid path")?;
-        assert_eq!(error.cell.as_deref(), Some("TOP"));
-        assert_eq!(error.element, Some("PATH"));
+        fixture.end_cell()?;
+        fixture.end()?;
+        let result = read(fixture.bytes.as_slice())?;
+        assert_eq!(result.layout.shape_count(), usize::from(!points.is_empty()));
     }
     Ok(())
 }
 
 #[test]
-fn array_counts_reject_zero_and_negative_signed_values() -> Result<(), Box<dyn Error>> {
+fn array_counts_accept_unsigned_values_and_recover_zero() -> Result<(), Box<dyn Error>> {
     for (columns, rows) in [(0, 1), (1, 0), (u16::MAX, 1), (1, u16::MAX)] {
         let mut fixture = Fixture::new()?;
         fixture.cell("TOP")?;
         fixture.array("LEAF", columns, rows, &[(0, 0), (30, 0), (0, 30)])?;
-        let error = read(fixture.bytes.as_slice())
-            .err()
-            .ok_or("Accepted invalid array counts")?;
-        assert_eq!(error.element, Some("AREF"));
-        assert!(error.message.contains("counts"));
+        fixture.end_cell()?;
+        fixture.end()?;
+        let result = read(fixture.bytes.as_slice())?;
+        let array = result
+            .layout
+            .cell(CellId::from_index(0))
+            .ok_or("Missing top")?
+            .instances()
+            .first()
+            .ok_or("Missing array")?
+            .array;
+        assert_eq!(array.columns, columns.max(1));
+        assert_eq!(array.rows, rows.max(1));
     }
     Ok(())
 }
@@ -346,5 +350,284 @@ fn labels_and_negative_widths_preserve_presentation() -> Result<(), Box<dyn Erro
         loaded.layout.top_cells().first(),
         Some(&CellId::from_index(1))
     );
+    Ok(())
+}
+
+#[test]
+fn gzip_detection_members_and_checksum_errors() -> Result<(), Box<dyn Error>> {
+    use std::io::Write;
+    let bytes = fixtures::demo()?;
+    let compress = |bytes: &[u8]| -> io::Result<Vec<u8>> {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(bytes)?;
+        encoder.finish()
+    };
+    let compressed = compress(&bytes)?;
+    assert_eq!(read(compressed.as_slice())?.layout.shape_count(), 7);
+    struct ShortReads<'a>(&'a [u8]);
+    impl io::Read for ShortReads<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let length = buffer.len().min(1);
+            io::Read::read(&mut self.0, &mut buffer[..length])
+        }
+    }
+    assert_eq!(read(ShortReads(&compressed))?.layout.shape_count(), 7);
+    assert_eq!(read(ShortReads(&bytes))?.layout.shape_count(), 7);
+    let middle = bytes.len() / 2;
+    let mut members = compress(bytes.get(..middle).ok_or("Missing first member")?)?;
+    members.extend(compress(
+        bytes.get(middle..).ok_or("Missing second member")?,
+    )?);
+    assert_eq!(read(members.as_slice())?.layout.shape_count(), 7);
+    let mut damaged = compressed.clone();
+    let checksum = damaged.len().checked_sub(8).ok_or("Missing checksum")?;
+    *damaged.get_mut(checksum).ok_or("Missing checksum byte")? ^= 1;
+    assert!(read(damaged.as_slice()).is_err());
+    assert!(
+        read(
+            compressed
+                .get(..compressed.len() - 1)
+                .ok_or("Missing gzip prefix")?
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn padded_and_byte_names_resolve_without_collisions() -> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new()?;
+    fixture.cell("TOP")?;
+    for name in [b"BB\0\0".as_slice(), &[0xff, 0], b"\\xff\0\0"] {
+        fixture.record(0x0a, 0, &[])?;
+        fixture.record(0x12, 6, name)?;
+        fixture.points(&[(0, 0)])?;
+        fixture.record(0x11, 0, &[])?;
+    }
+    fixture.end_cell()?;
+    for name in [b"BB\0\0".as_slice(), &[0xff, 0], b"\\xff\0\0"] {
+        fixture.record(0x05, 2, &[0; 24])?;
+        fixture.record(0x06, 6, name)?;
+        fixture.end_cell()?;
+    }
+    fixture.end()?;
+    let loaded = read(fixture.bytes.as_slice())?;
+    let top = loaded
+        .layout
+        .cell(CellId::from_index(0))
+        .ok_or("Missing top")?;
+    let names: Vec<_> = top
+        .instances()
+        .iter()
+        .map(|instance| loaded.layout.cell(instance.cell).map(Cell::name))
+        .collect();
+    assert_eq!(
+        names,
+        vec![Some("BB"), Some("\\xff"), Some("\\xff [name 1]")]
+    );
+    assert_eq!(loaded.layout.cells().count(), 4);
+    Ok(())
+}
+
+#[test]
+fn missing_references_are_retained_as_shared_empty_cells() -> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new()?;
+    fixture.cell("TOP")?;
+    for origin in [(0, 0), (10, 20)] {
+        fixture.reference("MISSING", origin, false, 0.0, 1.0)?;
+    }
+    fixture.end_cell()?;
+    fixture.end()?;
+    let loaded = read(fixture.bytes.as_slice())?;
+    assert_eq!(loaded.layout.cells().count(), 2);
+    assert_eq!(loaded.warnings.len(), 1);
+    let top = loaded
+        .layout
+        .cell(CellId::from_index(0))
+        .ok_or("Missing top")?;
+    assert_eq!(
+        top.instances().first().map(|instance| instance.cell),
+        top.instances().get(1).map(|instance| instance.cell)
+    );
+    assert!(
+        loaded
+            .layout
+            .cell(CellId::from_index(1))
+            .ok_or("Missing ghost")?
+            .shapes()
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn metadata_nodes_and_missing_endel_preserve_following_geometry() -> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new()?;
+    for kind in [0x1f, 0x20, 0x23, 0x37, 0x3a] {
+        fixture.string(kind, "metadata")?;
+    }
+    fixture.short(0x39, 1)?;
+    fixture.short(0x36, 1)?;
+    fixture.record(0x38, 0, &[])?;
+    fixture.short(0x2b, 1)?;
+    fixture.string(0x2c, "library property")?;
+    fixture.cell("TOP")?;
+    fixture.record(0x34, 1, &[0, 0])?;
+    fixture.short(0x2b, 2)?;
+    fixture.string(0x2c, "cell property")?;
+    fixture.record(0x15, 0, &[])?;
+    fixture.short(0x0d, 1)?;
+    fixture.short(0x2a, 0)?;
+    fixture.points(&[(0, 0)])?;
+    fixture.record(0x11, 0, &[])?;
+    fixture.polygon(1, &[(0, 0), (10, 0), (0, 10)])?;
+    fixture.bytes.truncate(fixture.bytes.len() - 4);
+    fixture.polygon(2, &[(20, 0), (30, 0), (20, 10)])?;
+    fixture.end_cell()?;
+    fixture.end()?;
+    let loaded = read(fixture.bytes.as_slice())?;
+    assert_eq!(loaded.layout.shape_count(), 2);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("Missing ENDEL"))
+    );
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("NODE"))
+    );
+    Ok(())
+}
+
+#[test]
+fn multiple_xy_odd_strings_and_large_records_are_supported() -> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new()?;
+    fixture.record(0x05, 2, &[0; 24])?;
+    fixture.bytes.extend([0, 5, 6, 6, b'T']);
+    fixture.record(0x08, 0, &[])?;
+    fixture.short(0x0d, 1)?;
+    fixture.short(0x0e, 0)?;
+    fixture.points(&[(0, 0), (10, 0)])?;
+    fixture.points(&[(10, 10), (0, 10), (0, 0)])?;
+    fixture.record(0x11, 0, &[])?;
+    fixture.record(0x09, 0, &[])?;
+    fixture.short(0x0d, 2)?;
+    fixture.short(0x0e, 0)?;
+    fixture.points(&[(0, 0)])?;
+    fixture.points(&[(10, 0)])?;
+    fixture.record(0x11, 0, &[])?;
+    fixture.polygon(3, &vec![(0, 0); 5000])?;
+    fixture.end_cell()?;
+    fixture.end()?;
+    let loaded = read(fixture.bytes.as_slice())?;
+    assert_eq!(loaded.layout.shape_count(), 3);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("Odd record"))
+    );
+    Ok(())
+}
+
+#[test]
+fn luna_path_and_recoverable_geometry_load() -> Result<(), Box<dyn Error>> {
+    let mut fixture = Fixture::new()?;
+    fixture.cell("TOP")?;
+    fixture.path(34, 0, 380, &[(14385, 985), (14575, 985), (14575, 4970)])?;
+    fixture.path(1, 99, -20, &[(0, 0), (5, 0), (0, 0), (0, 20)])?;
+    fixture.reference("LEAF", (0, 0), false, 0.0, 1.0)?;
+    let flags = fixture
+        .bytes
+        .windows(6)
+        .rposition(|bytes| bytes == [0, 6, 0x1a, 1, 0, 0])
+        .ok_or("Missing STRANS")?;
+    *fixture.bytes.get_mut(flags + 5).ok_or("Missing flags")? = 4;
+    fixture.record(0x2d, 0, &[])?;
+    fixture.short(0x0d, 4)?;
+    fixture.short(0x2e, 0)?;
+    fixture.points(&[(0, 10), (10, 0), (20, 10), (10, 20), (0, 10)])?;
+    fixture.record(0x11, 0, &[])?;
+    fixture.end_cell()?;
+    fixture.cell("LEAF")?;
+    fixture.end_cell()?;
+    fixture.end()?;
+    let loaded = read(fixture.bytes.as_slice())?;
+    assert_eq!(loaded.layout.shape_count(), 3);
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("STRANS"))
+    );
+    assert!(
+        loaded
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("PATHTYPE"))
+    );
+    Ok(())
+}
+
+#[test]
+fn local_gds_fixture_corpus_loads() -> Result<(), Box<dyn Error>> {
+    let Some(directory) = std::env::var_os("RLAYOUT_GDS_CORPUS_DIR") else {
+        eprintln!(
+            "RLAYOUT_GDS_CORPUS_DIR is unset; skipping the local corpus check; generated compatibility fixtures still run"
+        );
+        return Ok(());
+    };
+    let directory = std::path::PathBuf::from(directory).join("testdata/gds");
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|extension| extension == "gds")
+            && entry.metadata()?.len() < 2_000_000
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    assert!(paths.len() >= 53);
+    for path in paths {
+        read(std::fs::File::open(&path)?)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "Requires RLAYOUT_GDS_CORPUS_DIR and loads its full GDS corpus"]
+fn full_local_gds_corpus_loads() -> Result<(), Box<dyn Error>> {
+    let directory = std::env::var_os("RLAYOUT_GDS_CORPUS_DIR")
+        .ok_or("Set RLAYOUT_GDS_CORPUS_DIR to run the full local GDS corpus check")?;
+    let mut directories = vec![std::path::PathBuf::from(directory)];
+    let mut paths = Vec::new();
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                directories.push(entry.path());
+            } else {
+                let path = entry.path();
+                if path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.ends_with(".gds") || name.ends_with(".gds.gz")
+                }) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    assert!(paths.len() >= 859);
+    for path in &paths {
+        read(std::fs::File::open(path)?).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    println!("Loaded {} local GDS corpus files", paths.len());
     Ok(())
 }

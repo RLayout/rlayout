@@ -62,7 +62,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y \
             libxkbcommon-dev libwayland-dev libx11-dev libxi-dev \
-            libxcursor-dev libxrandr-dev
+            libxcursor-dev libxrandr-dev mesa-vulkan-drivers
+
+      - name: Configure headless Vulkan
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "$RUNNER_TEMP/xdg-runtime"
+          chmod 700 "$RUNNER_TEMP/xdg-runtime"
+          printf 'XDG_RUNTIME_DIR=%s\n' "$RUNNER_TEMP/xdg-runtime" >> "$GITHUB_ENV"
+          printf 'WGPU_BACKEND=vulkan\n' >> "$GITHUB_ENV"
 
       - name: Install Rust
         run: |

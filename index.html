@@ -16,7 +16,7 @@
 </head>
 <body>
     <canvas id="canvas"></canvas>
-    <input id="gds-file" type="file" accept=".gds,.gds2" hidden>
+    <input id="gds-file" type="file" accept=".gds,.gds2,.gds.gz,.gds2.gz,.gz" hidden>
     <div id="startup" role="status" aria-live="polite">
         <h1>RLayout</h1>
         <p id="startup-message">Starting the layout viewer…</p>
@@ -28,13 +28,16 @@
         function showFailure(error) {
             startup.hidden = false;
             startup.setAttribute("role", "alert");
-            message.textContent = `RLayout could not start.\n${error}\nTry a browser with WebGPU or WebGL enabled.`;
+            message.textContent = `RLayout could not start.\n${error}\nUse a browser with WebGPU enabled on HTTPS or localhost.`;
             console.error(error);
         }
         window.addEventListener("unhandledrejection", event => showFailure(event.reason));
         window.addEventListener("error", event => showFailure(event.message));
         window.addEventListener("TrunkApplicationStarted", async () => {
             try {
+                if (!window.isSecureContext || !navigator.gpu) {
+                    throw new Error("RLayout requires WebGPU in a secure browser context.");
+                }
                 const handle = new window.wasmBindings.WebHandle();
                 await handle.start(document.getElementById("canvas"));
                 startup.hidden = true;

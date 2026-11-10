@@ -539,6 +539,12 @@ impl Layout {
     pub fn bounds(&self, id: CellId) -> Option<Bounds> {
         self.bounds.get(id.index()).copied().flatten()
     }
+    pub fn absolute_path_padding(&self, id: CellId) -> f64 {
+        self.absolute_padding
+            .get(id.index())
+            .copied()
+            .unwrap_or_default()
+    }
     pub fn transformed_bounds(&self, id: CellId, transformation: Transformation) -> Option<Bounds> {
         let padding = self
             .absolute_padding
@@ -590,20 +596,10 @@ fn validate_shape(shape: &Shape) -> Result<(), LayoutError> {
             Err(LayoutError("Box must have positive area".into()))
         }
         Geometry::Path(path) => {
-            if path.points.is_empty() || (path.points.len() < 2 && path.ends != PathEnds::Round) {
-                return Err(LayoutError("Path has too few points".into()));
+            if path.points.is_empty() {
+                return Err(LayoutError("Path has no points".into()));
             }
-            if path
-                .points
-                .windows(2)
-                .any(|pair| pair.first() == pair.get(1))
-            {
-                return Err(LayoutError("Path has repeated consecutive points".into()));
-            }
-            let contour = path_contour(path, 1.0)?;
-            if !contour.is_empty() {
-                validate_contour(&contour)?;
-            }
+            path_contour(path, 1.0)?;
             Ok(())
         }
         Geometry::Label(label)
@@ -701,37 +697,38 @@ pub fn path_contour(path: &Path, magnification: f64) -> Result<Vec<DoublePoint>,
         .first()
         .ok_or_else(|| LayoutError("Empty path".into()))?
         .to_double();
-    if path.points.len() == 1 {
-        if path.ends != PathEnds::Round {
-            return Err(LayoutError("Single-point path requires round ends".into()));
-        }
-        return Ok((0..64)
-            .map(|index| {
-                let angle = f64::from(index) * std::f64::consts::TAU / 64.0;
-                first.plus(DoublePoint::new(angle.cos(), angle.sin()).times(half_width))
-            })
-            .collect());
+    let mut points: Vec<_> = path.points.iter().map(|point| point.to_double()).collect();
+    points.dedup();
+    if points.len() == 1 {
+        return Ok(match path.ends {
+            PathEnds::Round => (0..64)
+                .map(|index| {
+                    let angle = f64::from(index) * std::f64::consts::TAU / 64.0;
+                    first.plus(DoublePoint::new(angle.cos(), angle.sin()).times(half_width))
+                })
+                .collect(),
+            PathEnds::Flush => Vec::new(),
+            PathEnds::Square | PathEnds::Extended { .. } => {
+                let (beginning, end) = match path.ends {
+                    PathEnds::Extended { beginning, end } => (beginning as f64, end as f64),
+                    _ => (half_width, half_width),
+                };
+                vec![
+                    first.plus(DoublePoint::new(-beginning, half_width)),
+                    first.plus(DoublePoint::new(end, half_width)),
+                    first.plus(DoublePoint::new(end, -half_width)),
+                    first.plus(DoublePoint::new(-beginning, -half_width)),
+                ]
+            }
+        });
     }
-    let points: Vec<_> = path.points.iter().map(|point| point.to_double()).collect();
     let directions: Vec<_> = points
         .windows(2)
         .map(|pair| {
-            let first = pair
-                .first()
-                .copied()
-                .ok_or_else(|| LayoutError("Missing path point".into()))?;
-            let second = pair
-                .get(1)
-                .copied()
-                .ok_or_else(|| LayoutError("Missing path point".into()))?;
-            let direction = second.minus(first);
-            let length = direction.x.hypot(direction.y);
-            if length == 0.0 {
-                return Err(LayoutError("Repeated path point".into()));
-            }
-            Ok(direction.times(1.0 / length))
+            let direction = pair[1].minus(pair[0]);
+            direction.times(1.0 / direction.x.hypot(direction.y))
         })
-        .collect::<Result<Vec<_>, LayoutError>>()?;
+        .collect();
     let beginning_direction = *directions
         .first()
         .ok_or_else(|| LayoutError("Missing path direction".into()))?;
@@ -743,45 +740,74 @@ pub fn path_contour(path: &Path, magnification: f64) -> Result<Vec<DoublePoint>,
         PathEnds::Square => (half_width, half_width),
         PathEnds::Extended { beginning, end } => (beginning as f64, end as f64),
     };
-    let mut left = Vec::with_capacity(points.len());
-    let mut right = Vec::with_capacity(points.len());
-    for (index, point) in points.iter().copied().enumerate() {
-        let (center, offset) = if index == 0 {
-            (
-                point.minus(beginning_direction.times(beginning_extension)),
-                DoublePoint::new(-beginning_direction.y, beginning_direction.x).times(half_width),
-            )
-        } else if index == points.len() - 1 {
-            (
-                point.plus(end_direction.times(end_extension)),
-                DoublePoint::new(-end_direction.y, end_direction.x).times(half_width),
-            )
-        } else {
-            let before = *directions
-                .get(index - 1)
-                .ok_or_else(|| LayoutError("Missing path segment".into()))?;
-            let after = *directions
-                .get(index)
-                .ok_or_else(|| LayoutError("Missing path segment".into()))?;
-            let normal_before = DoublePoint::new(-before.y, before.x);
-            let normal_after = DoublePoint::new(-after.y, after.x);
-            let denominator = 1.0 + before.x * after.x + before.y * after.y;
-            if denominator < 1e-12 {
-                return Err(LayoutError(
-                    "Reversing path segments are unsupported".into(),
-                ));
-            }
-            (
-                point,
-                normal_before
-                    .plus(normal_after)
-                    .times(half_width / denominator),
-            )
+    let side = |points: &[DoublePoint], beginning: f64, end: f64| -> Vec<DoublePoint> {
+        let mut outline = Vec::with_capacity(points.len());
+        let direction = |first: DoublePoint, second: DoublePoint| {
+            let vector = second.minus(first);
+            vector.times(1.0 / vector.x.hypot(vector.y))
         };
-        left.push(center.plus(offset));
-        right.push(center.minus(offset));
-    }
-    let mut outline = left;
+        for (index, point) in points.iter().copied().enumerate() {
+            if index == 0 {
+                let after = direction(point, points[1]);
+                outline.push(
+                    point
+                        .minus(after.times(beginning))
+                        .plus(DoublePoint::new(-after.y, after.x).times(half_width)),
+                );
+            } else if index == points.len() - 1 {
+                let before = direction(points[index - 1], point);
+                outline.push(
+                    point
+                        .plus(before.times(end))
+                        .plus(DoublePoint::new(-before.y, before.x).times(half_width)),
+                );
+            } else {
+                let before = direction(points[index - 1], point);
+                let after = direction(point, points[index + 1]);
+                let normal_before = DoublePoint::new(-before.y, before.x).times(half_width);
+                let normal_after = DoublePoint::new(-after.y, after.x).times(half_width);
+                let determinant = cross(before, after);
+                if determinant.abs() > 1e-12 {
+                    let difference = normal_after.minus(normal_before);
+                    let along_before = cross(difference, after) / determinant;
+                    let along_after = cross(difference, before) / determinant;
+                    let previous = point.minus(points[index - 1]);
+                    let next = points[index + 1].minus(point);
+                    if along_before < -previous.x.hypot(previous.y) - half_width
+                        || along_after > next.x.hypot(next.y) + half_width
+                    {
+                        outline.extend([
+                            point.plus(normal_before),
+                            point,
+                            point.plus(normal_after),
+                        ]);
+                    } else if along_before <= half_width && along_after >= -half_width {
+                        outline.push(point.plus(normal_before).plus(before.times(along_before)));
+                    } else {
+                        outline.push(
+                            point
+                                .plus(normal_before)
+                                .plus(before.times(along_before.min(half_width))),
+                        );
+                        outline.push(
+                            point
+                                .plus(normal_after)
+                                .plus(after.times(along_after.max(-half_width))),
+                        );
+                    }
+                } else if before.x * after.x + before.y * after.y < 0.0 {
+                    outline.push(point.plus(normal_before).plus(before.times(half_width)));
+                    outline.push(point.plus(normal_after).minus(after.times(half_width)));
+                } else {
+                    outline.push(point.plus(normal_before));
+                }
+            }
+        }
+        outline
+    };
+    let mut outline = side(&points, beginning_extension, end_extension);
+    let reversed: Vec<_> = points.iter().rev().copied().collect();
+    let right = side(&reversed, end_extension, beginning_extension);
     if path.ends == PathEnds::Round {
         let center = *points
             .last()
@@ -792,7 +818,7 @@ pub fn path_contour(path: &Path, magnification: f64) -> Result<Vec<DoublePoint>,
             outline.push(center.plus(DoublePoint::new(angle.cos(), angle.sin()).times(half_width)));
         }
     }
-    outline.extend(right.into_iter().rev());
+    outline.extend(right);
     if path.ends == PathEnds::Round {
         let angle =
             beginning_direction.y.atan2(beginning_direction.x) - std::f64::consts::FRAC_PI_2;
@@ -800,6 +826,10 @@ pub fn path_contour(path: &Path, magnification: f64) -> Result<Vec<DoublePoint>,
             let angle = angle - f64::from(index) * std::f64::consts::PI / 32.0;
             outline.push(first.plus(DoublePoint::new(angle.cos(), angle.sin()).times(half_width)));
         }
+    }
+    outline.dedup();
+    if outline.first() == outline.last() {
+        outline.pop();
     }
     if outline.iter().any(|point| !point.finite()) {
         return Err(LayoutError("Path contour overflow".into()));

@@ -35,3 +35,8 @@ The browser reads selected or dropped GDSII files into memory and processes them
 locally. File contents are never uploaded. Parsing and scene preparation run on
 the main thread, so large layouts can pause the interface. Native loading remains
 threaded.
+
+The browser viewer requires WebGPU on HTTPS or localhost. Geometry rendering
+uses the same wgpu pipelines as the native app, with preparation advancing in
+bounded steps on the browser event loop. Browser workers and WebGL fallback
+are not enabled.

@@ -1,14 +1,39 @@
 pub use egui;
 
+mod gpu;
+mod prepare;
+mod spatial;
+
+#[cfg(test)]
+mod gpu_tests;
+#[cfg(test)]
+mod raster;
+
+pub use gpu::{GpuRendererHandle, RenderStatus};
+
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
-use egui::{Color32, Pos2, Rect, Vec2, epaint::Mesh};
+#[cfg(test)]
+use egui::epaint::Mesh;
+use egui::{Color32, Pos2, Rect, Vec2};
+#[cfg(test)]
+use rlayout_core::Path;
 use rlayout_core::{
-    Bounds, CellId, DoublePoint, Geometry, Label, LayerKey, Layout, Path, Transformation,
-    path_contour, validate_contour,
+    Bounds, CellId, DoublePoint, Geometry, Label, LayerKey, Layout, Transformation, path_contour,
+    shape_bounds,
 };
 use tess2_rust::{ElementType, TessStatus, Tessellator, WindingRule};
 
@@ -96,6 +121,7 @@ struct Polygon {
     bounds: Bounds,
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 enum PreparedGeometry {
     Polygon(Polygon),
@@ -104,6 +130,7 @@ enum PreparedGeometry {
     Label(Label),
 }
 
+#[cfg(test)]
 #[derive(Debug)]
 struct PreparedShape {
     layer: LayerKey,
@@ -113,15 +140,96 @@ struct PreparedShape {
 #[derive(Debug)]
 pub struct Scene {
     layout: Layout,
-    shapes: HashMap<CellId, Vec<PreparedShape>>,
+    revision: u64,
+    #[cfg(test)]
+    shapes: HashMap<CellId, OnceLock<Vec<PreparedShape>>>,
+    indexes: HashMap<CellId, spatial::SpatialIndex>,
+    label_metrics: Vec<(f64, f64)>,
+    #[cfg(test)]
     label_margin: f64,
 }
 
 impl Scene {
     pub fn prepare(layout: Layout) -> Result<Self, ViewError> {
+        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        let revision = NEXT_REVISION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+                revision.checked_add(1)
+            })
+            .map_err(|_| ViewError("Too many document revisions".into()))?;
+        #[cfg(test)]
         let mut shapes = HashMap::new();
+        let mut indexes = HashMap::new();
+        let mut label_metrics = vec![(0.0_f64, 0.0_f64); layout.cells().count()];
+        #[cfg(test)]
         let mut label_margin = 0.0_f64;
         for (id, cell) in layout.cells() {
+            #[cfg(test)]
+            shapes.insert(id, OnceLock::new());
+            for shape in cell.shapes() {
+                if let Geometry::Label(label) = &shape.geometry {
+                    label_metrics[id.index()].0 = label_metrics[id.index()]
+                        .0
+                        .max(label.text.chars().count() as f64);
+                    label_metrics[id.index()].1 = label_metrics[id.index()]
+                        .1
+                        .max(label.transformation.magnification);
+                    #[cfg(test)]
+                    {
+                        label_margin =
+                            label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
+                    }
+                }
+            }
+        }
+        loop {
+            let mut changed = false;
+            for (id, cell) in layout.cells() {
+                for instance in cell.instances() {
+                    let child = label_metrics[instance.cell.index()];
+                    let previous = label_metrics[id.index()];
+                    let updated = (
+                        previous.0.max(child.0),
+                        previous
+                            .1
+                            .max(child.1 * instance.transformation.magnification),
+                    );
+                    if updated != previous {
+                        label_metrics[id.index()] = updated;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (id, _) in layout.cells() {
+            indexes.insert(id, spatial::SpatialIndex::new(&layout, id, &label_metrics)?);
+        }
+        Ok(Self {
+            layout,
+            revision,
+            #[cfg(test)]
+            shapes,
+            indexes,
+            label_metrics,
+            #[cfg(test)]
+            label_margin,
+        })
+    }
+
+    #[cfg(test)]
+    fn prepared(&self, id: CellId) -> Result<&[PreparedShape], ViewError> {
+        let destination = self
+            .shapes
+            .get(&id)
+            .ok_or_else(|| ViewError("Missing prepared cell".into()))?;
+        if destination.get().is_none() {
+            let cell = self
+                .layout
+                .cell(id)
+                .ok_or_else(|| ViewError("Missing cell".into()))?;
             let mut prepared = Vec::with_capacity(cell.shapes().len());
             for (index, shape) in cell.shapes().iter().enumerate() {
                 let geometry = match &shape.geometry {
@@ -139,18 +247,13 @@ impl Scene {
                     Geometry::Path(path) if path.width == 0 => Ok(PreparedGeometry::Line(
                         path.points.iter().map(|point| point.to_double()).collect(),
                     )),
-                    Geometry::Path(path) => triangulate_path(path, 1.0).map(|polygon| {
-                        if path.absolute_width {
-                            PreparedGeometry::AbsolutePath(path.clone())
-                        } else {
-                            PreparedGeometry::Polygon(polygon)
-                        }
-                    }),
-                    Geometry::Label(label) => {
-                        label_margin =
-                            label_margin.max(label.text.chars().count() as f64 * 96.0 + 96.0);
-                        Ok(PreparedGeometry::Label(label.clone()))
+                    Geometry::Path(path) if path.absolute_width => {
+                        Ok(PreparedGeometry::AbsolutePath(path.clone()))
                     }
+                    Geometry::Path(path) => {
+                        triangulate_path(path, 1.0).map(PreparedGeometry::Polygon)
+                    }
+                    Geometry::Label(label) => Ok(PreparedGeometry::Label(label.clone())),
                 }
                 .map_err(|error| shape_error(cell.name(), shape.layer, index, error))?;
                 prepared.push(PreparedShape {
@@ -158,13 +261,14 @@ impl Scene {
                     geometry,
                 });
             }
-            shapes.insert(id, prepared);
+            if destination.set(prepared).is_err() && destination.get().is_none() {
+                return Err(ViewError("Preparing cell failed".into()));
+            }
         }
-        Ok(Self {
-            layout,
-            shapes,
-            label_margin,
-        })
+        destination
+            .get()
+            .map(|shapes| shapes.as_slice())
+            .ok_or_else(|| ViewError("Missing prepared shapes".into()))
     }
     pub fn layout(&self) -> &Layout {
         &self.layout
@@ -237,9 +341,17 @@ fn triangulate(points: Vec<DoublePoint>) -> Result<Polygon, ViewError> {
     })
 }
 
+#[cfg(test)]
 fn triangulate_path(path: &Path, magnification: f64) -> Result<Polygon, ViewError> {
     let points = path_contour(path, magnification).map_err(|error| ViewError(error.to_string()))?;
-    validate_contour(&points).map_err(|error| ViewError(error.to_string()))?;
+    if points.len() < 3 {
+        return Ok(Polygon {
+            points: Vec::new(),
+            triangles: Vec::new(),
+            bounds: Bounds::from_points(path.points.iter().map(|point| point.to_double()))
+                .ok_or_else(|| ViewError("Empty path".into()))?,
+        });
+    }
     triangulate(points)
 }
 
@@ -258,12 +370,29 @@ pub struct LayerStyle {
     pub color: Color32,
 }
 
+#[cfg(test)]
+pub struct RenderedTile {
+    pub rect: Rect,
+    pub texture: egui::TextureId,
+    pub preview: bool,
+}
+
+pub struct RenderedImage {
+    pub image: egui::ColorImage,
+    pub shape_count: usize,
+    pub cache_bytes: usize,
+    pub statistics: RenderStatus,
+}
+
+#[cfg(test)]
 #[derive(Default)]
 pub struct RenderedFrame {
     pub meshes: Vec<Arc<Mesh>>,
     pub lines: Vec<egui::Shape>,
     pub shape_count: usize,
     pub truncated: bool,
+    pub complete: bool,
+    pub tiles: Vec<RenderedTile>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -284,14 +413,18 @@ pub struct Viewer {
     pub hierarchy_depth: u16,
     pub styles: BTreeMap<LayerKey, LayerStyle>,
     fit_pending: bool,
-    frame: Option<(FrameKey, RenderedFrame)>,
+    #[cfg(test)]
     absolute_paths: HashMap<(CellId, usize, u64), Polygon>,
     pub cursor: Option<DoublePoint>,
     pub error: Option<String>,
+    renderer: gpu::RenderSession,
+    requested: Option<FrameKey>,
+    changed_at: Instant,
+    exact_requested: bool,
 }
 
 impl Viewer {
-    pub fn new(scene: Scene) -> Self {
+    pub fn new(scene: Scene, renderer: GpuRendererHandle) -> Result<Self, ViewError> {
         let selected = scene.layout.top_cells().first().copied();
         let palette = [
             Color32::from_rgb(91, 174, 229),
@@ -320,18 +453,24 @@ impl Viewer {
                 )
             })
             .collect();
-        Self {
-            scene: Arc::new(scene),
+        let scene = Arc::new(scene);
+        let renderer = renderer.create_session(scene.clone())?;
+        Ok(Self {
+            scene,
             camera: Camera::default(),
             selected,
             hierarchy_depth: u16::MAX,
             styles,
             fit_pending: true,
-            frame: None,
+            #[cfg(test)]
             absolute_paths: HashMap::new(),
             cursor: None,
             error: None,
-        }
+            renderer,
+            requested: None,
+            changed_at: Instant::now(),
+            exact_requested: false,
+        })
     }
     pub fn layout(&self) -> &Layout {
         &self.scene.layout
@@ -464,40 +603,38 @@ impl Viewer {
             selected: self.selected,
             depth: self.hierarchy_depth,
             styles: self.styles.clone(),
-            text_pass: if self.scene.label_margin > 0.0 {
-                ui.ctx().cumulative_pass_nr()
-            } else {
-                0
-            },
+            text_pass: 0,
         };
-        if self
-            .frame
-            .as_ref()
-            .is_none_or(|(previous, _)| *previous != key)
-        {
-            match self.render(ui.ctx(), viewport) {
-                Ok(frame) => {
-                    self.frame = Some((key, frame));
-                    self.error = None;
-                }
-                Err(error) => {
-                    self.error = Some(error.to_string());
-                    self.frame = None;
-                }
-            }
+        if self.requested.as_ref() != Some(&key) {
+            self.requested = Some(key.clone());
+            self.changed_at = Instant::now();
+            self.exact_requested = false;
+            self.error = self
+                .renderer
+                .request(key.clone(), ui.ctx().clone(), true)
+                .err()
+                .map(|error| error.to_string());
         }
-        if let Some((_, frame)) = &self.frame {
-            for mesh in &frame.meshes {
-                painter.add(egui::Shape::Mesh(mesh.clone()));
-            }
-            for line in &frame.lines {
-                painter.add(line.clone());
-            }
-            if frame.truncated {
-                painter.text(viewport.left_top() + Vec2::splat(12.0), egui::Align2::LEFT_TOP,
-                    "Display limit reached: some geometry is omitted. Zoom in or reduce hierarchy depth.",
-                    egui::FontId::proportional(14.0), Color32::YELLOW);
-            }
+        let quiet = self.changed_at.elapsed();
+        if !self.exact_requested {
+            ui.ctx()
+                .request_repaint_after(Duration::from_millis(150).saturating_sub(quiet));
+        }
+        if !self.exact_requested && quiet >= Duration::from_millis(150) {
+            self.exact_requested = true;
+            self.error = self
+                .renderer
+                .request(key, ui.ctx().clone(), false)
+                .err()
+                .map(|error| error.to_string());
+        }
+        painter.add(self.renderer.callback(viewport, self.camera));
+        let status = self.renderer.status();
+        if let Some(error) = status.error {
+            self.error = Some(error);
+        }
+        if !status.complete && self.error.is_none() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
         }
         if self.selected.is_none() {
             painter.text(
@@ -518,18 +655,50 @@ impl Viewer {
             );
         }
     }
-    pub fn visible_shape_count(&self) -> usize {
-        self.frame
-            .as_ref()
-            .map_or(0, |(_, frame)| frame.shape_count)
+    pub fn rendering_complete(&self) -> bool {
+        self.exact_requested && self.renderer.status().complete
     }
 
+    pub fn render_status(&self) -> RenderStatus {
+        self.renderer.status()
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn render_image(
+        &mut self,
+        context: &egui::Context,
+        viewport: Rect,
+    ) -> Result<RenderedImage, ViewError> {
+        self.renderer
+            .capture(
+                FrameKey {
+                    camera: self.camera,
+                    viewport,
+                    pixels_per_point: context.pixels_per_point(),
+                    selected: self.selected,
+                    depth: self.hierarchy_depth,
+                    styles: self.styles.clone(),
+                    text_pass: 0,
+                },
+                context.clone(),
+            )
+            .await
+    }
+
+    pub fn visible_shape_count(&self) -> usize {
+        self.renderer.status().shape_count
+    }
+
+    #[cfg(test)]
     pub fn render(
         &mut self,
         context: &egui::Context,
         viewport: Rect,
     ) -> Result<RenderedFrame, ViewError> {
-        let mut result = RenderedFrame::default();
+        let mut result = RenderedFrame {
+            complete: true,
+            ..Default::default()
+        };
         let Some(selected) = self.selected else {
             return Ok(result);
         };
@@ -540,13 +709,7 @@ impl Viewer {
         let mut stack = vec![(selected, Transformation::default(), 0_u16)];
         let mut batches: BTreeMap<LayerKey, Mesh> = BTreeMap::new();
         let mut text_batches: BTreeMap<LayerKey, Mesh> = BTreeMap::new();
-        let mut visited = 0_usize;
         while let Some((id, transformation, depth)) = stack.pop() {
-            visited += 1;
-            if visited > 250_000 {
-                result.truncated = true;
-                break;
-            }
             if !scene
                 .layout
                 .transformed_bounds(id, transformation)
@@ -557,13 +720,9 @@ impl Viewer {
             if !transformation.valid() {
                 return Err(ViewError("Hierarchy transformation overflow".into()));
             }
-            if let Some(shapes) = scene.shapes.get(&id) {
+            {
+                let shapes = scene.prepared(id)?;
                 for (index, shape) in shapes.iter().enumerate() {
-                    visited += 1;
-                    if visited > 250_000 {
-                        result.truncated = true;
-                        break;
-                    }
                     let Some(style) = self.styles.get(&shape.layer).filter(|style| style.visible)
                     else {
                         continue;
@@ -675,10 +834,6 @@ impl Viewer {
                     );
                     for row in rows.0..rows.1 {
                         for column in columns.0..columns.1 {
-                            if stack.len() + visited >= 250_000 {
-                                result.truncated = true;
-                                break;
-                            }
                             let translation = base
                                 .translation
                                 .plus(column_step.times(f64::from(column)))
@@ -793,6 +948,7 @@ fn hierarchy_row(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn paint_polygon(
     mesh: &mut Mesh,
     polygon: &Polygon,
@@ -833,6 +989,7 @@ fn paint_polygon(
     Ok(true)
 }
 
+#[cfg(test)]
 fn paint_label(
     mesh: &mut Mesh,
     context: &egui::Context,
@@ -955,3 +1112,16 @@ fn projected_range(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn test_renderer() -> Result<GpuRendererHandle, ViewError> {
+    static RENDERER: std::sync::OnceLock<Result<GpuRendererHandle, String>> =
+        std::sync::OnceLock::new();
+    RENDERER
+        .get_or_init(|| {
+            pollster::block_on(GpuRendererHandle::headless()).map_err(|error| error.to_string())
+        })
+        .as_ref()
+        .cloned()
+        .map_err(|error| ViewError(error.clone()))
+}

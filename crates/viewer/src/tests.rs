@@ -53,7 +53,7 @@ fn scene_with_instances() -> Result<Scene, Box<dyn Error>> {
 
 #[test]
 fn culls_offscreen_hierarchy_and_respects_depth_and_layers() -> Result<(), Box<dyn Error>> {
-    let mut viewer = Viewer::new(scene_with_instances()?);
+    let mut viewer = Viewer::new(scene_with_instances()?, test_renderer()?)?;
     let context = egui::Context::default();
     let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0));
     let rendered = viewer.render(&context, viewport)?;
@@ -66,6 +66,19 @@ fn culls_offscreen_hierarchy_and_respects_depth_and_layers() -> Result<(), Box<d
         style.visible = false;
     }
     assert_eq!(viewer.render(&context, viewport)?.shape_count, 0);
+    Ok(())
+}
+
+#[test]
+fn completed_gpu_capture_contains_fixture_geometry() -> Result<(), Box<dyn Error>> {
+    let mut viewer = Viewer::new(scene_with_instances()?, test_renderer()?)?;
+    let context = egui::Context::default();
+    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(520.0, 280.0));
+    let mut output = context.run_ui(egui::RawInput::default(), |_| {});
+    output.textures_delta.clear();
+    let image = pollster::block_on(viewer.render_image(&context, viewport))?;
+    assert!(image.image.pixels.iter().any(|pixel| pixel.a() != 0));
+    assert_eq!(image.image.size, [520, 280]);
     Ok(())
 }
 
@@ -425,7 +438,7 @@ fn nonzero_winding_fills_the_center_of_a_self_intersecting_star() -> Result<(), 
 }
 
 #[test]
-fn absolute_path_revalidation_reports_shape_context() -> Result<(), Box<dyn Error>> {
+fn absolute_paths_accept_overlapping_enlarged_contours() -> Result<(), Box<dyn Error>> {
     let path = Path {
         points: vec![
             Point::new(0, 0),
@@ -467,16 +480,13 @@ fn absolute_path_revalidation_reports_shape_context() -> Result<(), Box<dyn Erro
             ),
         ],
     )?;
-    let mut viewer = Viewer::new(Scene::prepare(layout)?);
-    let error = viewer
-        .render(
-            &egui::Context::default(),
-            Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
-        )
-        .err()
-        .ok_or("Expected an invalid enlarged path contour")?;
-    assert!(error.0.contains("Cell LEAF, layer 7/2, shape 1"));
-    assert!(error.0.contains("contours"));
+    let mut viewer = Viewer::new(Scene::prepare(layout)?, test_renderer()?)?;
+    let frame = viewer.render(
+        &egui::Context::default(),
+        Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0)),
+    )?;
+    assert_eq!(frame.shape_count, 1);
+    assert!(frame.complete);
     Ok(())
 }
 
@@ -502,7 +512,7 @@ fn fit_and_pan_use_the_canvas_coordinate_system() {
 
 #[test]
 fn canvas_middle_drag_pans_without_changing_scale() -> Result<(), Box<dyn Error>> {
-    let mut viewer = Viewer::new(scene_with_instances()?);
+    let mut viewer = Viewer::new(scene_with_instances()?, test_renderer()?)?;
     let context = egui::Context::default();
     let mut draw = |events| {
         let input = egui::RawInput {
@@ -556,7 +566,7 @@ fn label_meshes_have_normalized_font_coordinates() -> Result<(), Box<dyn Error>>
         0.001,
         vec![Cell::new("TOP".into(), vec![shape], vec![])],
     )?;
-    let mut viewer = Viewer::new(Scene::prepare(layout)?);
+    let mut viewer = Viewer::new(Scene::prepare(layout)?, test_renderer()?)?;
     let context = egui::Context::default();
     let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::splat(400.0));
     let mut rendered = None;
@@ -572,78 +582,6 @@ fn label_meshes_have_normalized_font_coordinates() -> Result<(), Box<dyn Error>>
         mesh.vertices
             .iter()
             .all(|vertex| (0.0..=1.0).contains(&vertex.uv.x) && (0.0..=1.0).contains(&vertex.uv.y))
-    );
-    Ok(())
-}
-
-#[test]
-#[ignore = "Run with --release --ignored --nocapture for the 100,000-shape render benchmark"]
-fn benchmark_navigation() -> Result<(), Box<dyn Error>> {
-    let start = std::time::Instant::now();
-    let shapes = (0..100_000_i64)
-        .map(|index| {
-            let x = index % 500 * 12;
-            let y = index / 500 * 12;
-            Shape {
-                layer: LayerKey {
-                    layer: (index % 6) as u16,
-                    datatype: 0,
-                },
-                geometry: Geometry::Polygon(vec![
-                    Point::new(x, y),
-                    Point::new(x + 10, y),
-                    Point::new(x + 10, y + 10),
-                    Point::new(x, y + 10),
-                ]),
-            }
-        })
-        .collect();
-    let layout = Layout::new(
-        "benchmark".into(),
-        1e-9,
-        0.001,
-        vec![Cell::new("TOP".into(), shapes, vec![])],
-    )?;
-    let mut viewer = Viewer::new(Scene::prepare(layout)?);
-    let preparation = start.elapsed();
-    let viewport = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
-    viewer.camera.fit(
-        viewer.selected.and_then(|id| viewer.layout().bounds(id)),
-        viewport,
-    );
-    let context = egui::Context::default();
-    let start = std::time::Instant::now();
-    let frame = viewer.render(&context, viewport)?;
-    assert_eq!(frame.shape_count, 100_000);
-    assert!(!frame.truncated);
-    let mut durations = Vec::new();
-    for _ in 0..30 {
-        viewer.camera.pan(Vec2::new(0.5, 0.5));
-        let start = std::time::Instant::now();
-        let frame = viewer.render(&context, viewport)?;
-        assert!(!frame.truncated);
-        durations.push(start.elapsed().as_secs_f64() * 1000.0);
-    }
-    durations.sort_by(f64::total_cmp);
-    let median = durations
-        .get(15)
-        .copied()
-        .ok_or("Missing benchmark median")?;
-    let maximum = durations
-        .last()
-        .copied()
-        .ok_or("Missing benchmark maximum")?;
-    println!(
-        "100k shapes: preparation {:.2} ms; initial and navigation total {:.2} ms; median {:.2} ms, maximum {:.2} ms; CPU {:.1} fps",
-        preparation.as_secs_f64() * 1000.0,
-        start.elapsed().as_secs_f64() * 1000.0,
-        median,
-        maximum,
-        1000.0 / median
-    );
-    assert!(
-        median < 33.333,
-        "CPU mesh preparation missed the 30 FPS target: {median:.2} ms"
     );
     Ok(())
 }

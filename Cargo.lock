@@ -1944,6 +1944,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "js-sys",
+ "pollster",
  "rlayout-gds",
  "rlayout-viewer",
  "wasm-bindgen",
@@ -1960,6 +1961,7 @@ version = "0.1.0"
 name = "rlayout-gds"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "rlayout-core",
 ]
 
@@ -1967,9 +1969,13 @@ dependencies = [
 name = "rlayout-viewer"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "egui",
+ "egui-wgpu",
+ "pollster",
  "rlayout-core",
  "tess2-rust",
+ "web-time",
 ]
 
 [[package]]
